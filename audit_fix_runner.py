@@ -163,6 +163,18 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--max-turns",
+        dest="max_turns",
+        type=int,
+        default=60,
+        help=(
+            "Cap each row's Claude session at N agent turns, so a session "
+            "that gets stuck (e.g. polling in a loop waiting on a slow "
+            "command) fails fast and cleanly instead of silently running "
+            "out of budget. Default: 60."
+        ),
+    )
+    parser.add_argument(
         "--test-cmd",
         dest="test_cmd",
         default=None,
@@ -702,35 +714,75 @@ FILE_EDIT_TOOL_NAMES = {"Edit", "Write", "MultiEdit"}
 BASH_COMMAND_CONSOLE_PREVIEW_LENGTH = 80
 
 
-def console_line_for_tool_use(tool_name, tool_input):
+# ======================================================================
+# TERMINAL UI & FORMATTING HELPERS
+# ======================================================================
+
+class TermColors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    GRAY = "\033[90m"
+
+def print_banner(title, color=TermColors.CYAN):
+    """Prints a styled box banner around sections."""
+    width = 64
+    print(f"\n{color}{TermColors.BOLD}╔{'═' * (width - 2)}╗")
+    print(f"║ {title.center(width - 4)} ║")
+    print(f"╚{'═' * (width - 2)}╝{TermColors.RESET}\n")
+
+def short_path(file_path, project_path):
+    """Truncates absolute paths relative to project root for cleaner output."""
+    if not file_path:
+        return "file"
+    try:
+        rel = Path(file_path).relative_to(project_path)
+        return f"./{rel}"
+    except ValueError:
+        return str(file_path)
+
+
+def console_line_for_tool_use(tool_name, tool_input, project_path):
     """
-    Given one tool_use content block's name and input dict (from a parsed
-    stream-json "assistant" event), return the short console progress line
-    to print for it, or None if this tool shouldn't produce any console
-    output.
+    Returns a styled, human-readable console progress line for a tool call.
+    Returns None for tool types that shouldn't print anything to console.
+    This function is for CONSOLE DISPLAY ONLY -- the caller is responsible
+    for writing the full raw event to the log file separately, with ANSI
+    codes stripped, exactly as it already does today.
     """
+    G = TermColors.GRAY
+    C = TermColors.CYAN
+    R = TermColors.RESET
+
     if tool_name in FILE_EDIT_TOOL_NAMES:
-        file_path = tool_input.get("file_path")
-        if file_path:
-            return f"  Editing {Path(file_path).name}..."
-        return "  Editing a file..."
+        file_path = tool_input.get("file_path", "") if tool_input else ""
+        clean_path = short_path(file_path, project_path)
+        return f"  {TermColors.YELLOW}✎ {R}{G}Editing {TermColors.BOLD}{clean_path}{R}"
 
     if tool_name == "Bash":
-        command = tool_input.get("command", "")
+        command = tool_input.get("command", "") if tool_input else ""
+        command = command.replace(str(project_path), ".")
         if len(command) > BASH_COMMAND_CONSOLE_PREVIEW_LENGTH:
-            command = command[:BASH_COMMAND_CONSOLE_PREVIEW_LENGTH]
-        return f"  Running: {command}..."
+            command = command[:BASH_COMMAND_CONSOLE_PREVIEW_LENGTH] + "..."
+        return f"  {C}⚡{R} {G}Running:{R} {TermColors.ITALIC}{command}{R}"
 
     if tool_name == "Read":
-        file_path = tool_input.get("file_path")
-        if file_path:
-            return f"  Reading {Path(file_path).name}..."
-        return "  Reading a file..."
+        file_path = tool_input.get("file_path", "") if tool_input else ""
+        clean_path = short_path(file_path, project_path)
+        return f"  {G}\U0001F4D6 Reading {clean_path}...{R}"
 
     return None
 
 
-def console_lines_for_stream_json_event(event):
+def console_lines_for_stream_json_event(event, project_path):
     """
     Given one successfully parsed stream-json event (a dict with a "type"
     field), return a list of short, human-readable console progress lines
@@ -754,7 +806,7 @@ def console_lines_for_stream_json_event(event):
         for block in content_blocks:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 console_line = console_line_for_tool_use(
-                    block.get("name", ""), block.get("input") or {}
+                    block.get("name", ""), block.get("input") or {}, project_path
                 )
                 if console_line:
                     console_lines.append(console_line)
@@ -763,11 +815,89 @@ def console_lines_for_stream_json_event(event):
     return []
 
 
-def run_claude_session(prompt, project_path, log_path):
+def detect_turn_limit_hit(result_event):
+    """
+    Given a parsed stream-json "result" event, return True if the session
+    was cut off because it hit --max-turns, False if it ended normally, or
+    None if this can't be determined from this event's shape.
+
+    Based on real result events collected 2026-08-03:
+
+    - A session that got stuck polling in a loop (waiting on a slow Gradle
+      run) but quit on its own before any turn cap looked like a totally
+      normal completion -- {"subtype": "success", "is_error": false,
+      "terminal_reason": "completed", "num_turns": 55, ...}. Nothing about
+      that event distinguishes it from a genuinely finished session; this
+      function correctly returns False for it. This is why the turn-limit
+      message below is only a heuristic, not a guarantee it catches every
+      "actually stuck" session -- it only catches ones that ran the cap
+      all the way out instead of quitting first.
+    - A session actually cut off by `--max-turns` (reproduced by running
+      `claude -p ... --max-turns 1` against a multi-tool-call prompt)
+      looked like -- {"subtype": "error_max_turns", "is_error": true,
+      "terminal_reason": "max_turns", "num_turns": 2,
+      "errors": ["Reached maximum number of turns (1)"], ...}.
+
+    If a future CLI version renames these fields, this falls back to None
+    (unknown) rather than raising or guessing.
+    """
+    try:
+        subtype = result_event.get("subtype")
+        terminal_reason = result_event.get("terminal_reason")
+    except AttributeError:
+        return None
+
+    if subtype == "error_max_turns" or terminal_reason == "max_turns":
+        return True
+    if subtype == "success" or terminal_reason == "completed":
+        return False
+    return None
+
+
+_caffeinate_warning_printed = False
+
+
+def start_caffeinate_for_row():
+    """
+    Start a `caffeinate -dim` background process so the Mac can't sleep
+    during one row's Claude session (-d display, -i idle, -m disk -- this
+    covers a long test/build run without the user needing to run
+    caffeinate manually). Returns the Popen object, or None if caffeinate
+    isn't available on this machine (e.g. not macOS) -- in that case a
+    one-line warning is printed once, the first time it happens, not on
+    every row.
+    """
+    global _caffeinate_warning_printed
+    try:
+        return subprocess.Popen(["caffeinate", "-dim"])
+    except FileNotFoundError:
+        if not _caffeinate_warning_printed:
+            print("caffeinate not available -- sleep prevention disabled")
+            _caffeinate_warning_printed = True
+        return None
+
+
+def stop_caffeinate_for_row(caffeinate_process):
+    """
+    Stop a caffeinate process started for one row, if any. Tries a clean
+    terminate() first; if it doesn't exit within 5 seconds, kill() it so
+    it never lingers between rows or after the script exits.
+    """
+    if caffeinate_process is None:
+        return
+    caffeinate_process.terminate()
+    try:
+        caffeinate_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        caffeinate_process.kill()
+        caffeinate_process.wait()
+
+
+def run_claude_session(prompt, project_path, log_path, max_turns):
     """
     Run `claude -p <prompt> --permission-mode acceptEdits --verbose
-    --output-format stream-json` as a subprocess with its working directory
-    set to project_path.
+    --output-format stream-json --max-turns <max_turns>` as a subprocess
+    with its working directory set to project_path.
 
     stream-json makes the session emit one JSON object per line (NDJSON)
     as it works, instead of one final text blob. Each line is parsed as it
@@ -780,6 +910,27 @@ def run_claude_session(prompt, project_path, log_path):
     is always written to log_path in full, so the log file remains the
     complete, unabridged record even though the console only shows short
     summaries. stderr is captured too.
+
+    A `caffeinate -dim` process is started for the duration of this row's
+    session only (so the Mac can't sleep mid-fix or mid-test-run) and is
+    always stopped before this function returns or raises -- normal
+    completion, a non-zero exit code, an exception, or KeyboardInterrupt.
+
+    Returns a tuple of (returncode, hit_turn_limit, saw_result_event).
+
+    hit_turn_limit is True only if the session's final "result" event
+    clearly indicates it was cut off by --max-turns; False otherwise
+    (including when this can't be determined -- see detect_turn_limit_hit()).
+
+    saw_result_event is True if a stream-json "result" event was seen at
+    any point. A session that finishes on its own (success, error, or even
+    hitting --max-turns) always emits exactly one. A session killed from
+    outside -- SIGTERM from the OS, an OOM kill, a supervisor timeout --
+    aborts mid-turn and never emits one. Combined with returncode, this is
+    what distinguishes "Claude Code decided to stop" from "something killed
+    the process out from under it": a negative/143 returncode with
+    saw_result_event False means it was killed externally, not that it hit
+    --max-turns or finished normally.
     """
     command = [
         "claude",
@@ -790,50 +941,68 @@ def run_claude_session(prompt, project_path, log_path):
         "--verbose",
         "--output-format",
         "stream-json",
+        "--max-turns",
+        str(max_turns),
     ]
 
+    print("Preventing sleep for this row...")
+    caffeinate_process = start_caffeinate_for_row()
+
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=project_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except FileNotFoundError:
-        print("ERROR: the 'claude' command was not found on your PATH.")
-        print("Install Claude Code and make sure 'claude' is runnable from your shell.")
-        raise ClaudeNotFoundError("'claude' was not found on PATH")
-
-    with open(log_path, "w", encoding="utf-8") as log_file:
         try:
-            for line in process.stdout:
-                clean_line = strip_ansi_codes(line)
-                log_file.write(clean_line)
-                log_file.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=project_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            print("ERROR: the 'claude' command was not found on your PATH.")
+            print("Install Claude Code and make sure 'claude' is runnable from your shell.")
+            raise ClaudeNotFoundError("'claude' was not found on PATH")
 
-                json_text = clean_line.strip()
-                if not json_text:
-                    continue
+        hit_turn_limit = False
+        saw_result_event = False
 
-                try:
-                    event = json.loads(json_text)
-                except ValueError:
-                    # Streaming output can be noisy (partial/malformed
-                    # lines). The raw text is already in the log above --
-                    # just skip console progress for this one line.
-                    continue
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            try:
+                for line in process.stdout:
+                    clean_line = strip_ansi_codes(line)
+                    log_file.write(clean_line)
+                    log_file.flush()
 
-                for console_line in console_lines_for_stream_json_event(event):
-                    print(console_line)
-        except KeyboardInterrupt:
-            process.terminate()
-            process.wait()
-            raise
+                    json_text = clean_line.strip()
+                    if not json_text:
+                        continue
 
-    process.wait()
-    return process.returncode
+                    try:
+                        event = json.loads(json_text)
+                    except ValueError:
+                        # Streaming output can be noisy (partial/malformed
+                        # lines). The raw text is already in the log above --
+                        # just skip console progress for this one line.
+                        continue
+
+                    if event.get("type") == "result":
+                        saw_result_event = True
+                        if detect_turn_limit_hit(event):
+                            hit_turn_limit = True
+
+                    for console_line in console_lines_for_stream_json_event(event, project_path):
+                        print(console_line)
+            except KeyboardInterrupt:
+                process.terminate()
+                process.wait()
+                raise
+
+        process.wait()
+        return process.returncode, hit_turn_limit, saw_result_event
+    finally:
+        if caffeinate_process is not None:
+            stop_caffeinate_for_row(caffeinate_process)
+            print("Sleep prevention released.")
 
 
 # ======================================================================
@@ -955,9 +1124,7 @@ def send_mac_notification(message_text):
 def main():
     args = parse_arguments()
 
-    print("=" * 60)
-    print("AUDIT FIX RUNNER -- PRE-FLIGHT")
-    print("=" * 60)
+    print_banner("AUDIT FIX RUNNER -- PRE-FLIGHT", color=TermColors.BLUE)
 
     project_path = Path(args.project).expanduser().resolve()
     audit_path = validate_project_path(project_path)
@@ -992,9 +1159,7 @@ def main():
         print("No 'Not started' rows match your filters. Nothing to do.")
         sys.exit(0)
 
-    print("=" * 60)
-    print("AUDIT FIX RUNNER -- LOOP")
-    print("=" * 60)
+    print_banner("AUDIT FIX RUNNER -- LOOP", color=TermColors.BLUE)
 
     logs_folder = ensure_logs_folder(project_path)
     start_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1014,8 +1179,7 @@ def main():
 
             confirm_clean_working_tree(project_path, current_row_id=current_row_id)
 
-            print()
-            print(f"=== Row {position}/{len(ordered_rows)}: {current_row_id} ({row['severity']}) ===")
+            print_banner(f"Row {position}/{len(ordered_rows)}: {current_row_id} ({row['severity']})")
             print(f"Rows completed so far this run: {len(rows_processed_this_run)}")
 
             prompt = build_prompt(current_row_id, branch_name, test_cmd_for_prompt)
@@ -1023,7 +1187,15 @@ def main():
             log_path = build_row_log_path(logs_folder, current_row_id)
             print(f"Starting Claude session. Logging to: {log_path}\n")
 
-            run_claude_session(prompt, project_path, log_path)
+            returncode, hit_turn_limit, saw_result_event = run_claude_session(
+                prompt, project_path, log_path, args.max_turns
+            )
+            # returncode -15 (SIGTERM) or 143 (128 + SIGTERM) with no "result"
+            # event ever seen means the process was killed from outside --
+            # by the OS (OOM), a supervisor, or some other external timeout --
+            # rather than Claude Code itself deciding to stop (which always
+            # emits a final "result" event, even for --max-turns or an error).
+            likely_killed_externally = returncode in (-15, 143) and not saw_result_event
 
             fresh_rows = parse_master_tracking_table(audit_path)
             updated_row = find_row_by_id(fresh_rows, current_row_id)
@@ -1035,18 +1207,55 @@ def main():
                 result_status = updated_row["fix_status"] or "(blank)"
                 result_note = updated_row["notes"]
 
-            print(f"\nResult: {current_row_id} -> {result_status}")
+            if status_matches(result_status, STATUS_FIXED):
+                result_color = TermColors.GREEN
+            elif status_matches(result_status, STATUS_BLOCKED):
+                result_color = TermColors.YELLOW
+            else:
+                result_color = TermColors.RED
+            print(f"\nResult: {current_row_id} -> {result_color}{result_status}{TermColors.RESET}")
             if result_note:
                 print(f"Note: {result_note}")
+            if likely_killed_externally:
+                print(
+                    f"{TermColors.RED}This row's Claude session was killed from outside "
+                    f"(exit code {returncode}, no final 'result' event ever seen in the "
+                    f"log) -- not by --max-turns and not by Claude Code choosing to stop. "
+                    "Likely causes: the OS killed it (e.g. out of memory), the machine "
+                    "slept despite caffeinate, or an external supervisor/timeout. This is "
+                    f"NOT a sign the fix was hard.{TermColors.RESET}"
+                )
+
             if status_matches(result_status, STATUS_NOT_STARTED):
-                print("This row is still 'Not started' -- the session may not have finished correctly.")
+                if hit_turn_limit:
+                    print(
+                        f"This row hit the --max-turns limit ({args.max_turns}) before "
+                        "finishing. It likely got stuck (e.g. waiting on a slow command) "
+                        "rather than being genuinely hard. Check the log file, and "
+                        "consider re-running this row by hand with more turns, or "
+                        "investigating why it stalled, before assuming it's simply a "
+                        "difficult finding."
+                    )
+                elif not likely_killed_externally:
+                    print("This row is still 'Not started' -- the session may not have finished correctly.")
+
+            summary_note = result_note
+            if likely_killed_externally:
+                summary_note = (
+                    f"{result_note} -- " if result_note else ""
+                ) + f"KILLED EXTERNALLY (exit code {returncode}, no result event)"
 
             rows_processed_this_run.append(
-                {"id": current_row_id, "severity": row["severity"], "status": result_status, "note": result_note}
+                {
+                    "id": current_row_id,
+                    "severity": row["severity"],
+                    "status": result_status,
+                    "note": summary_note,
+                }
             )
             append_to_run_summary_file(
                 run_summary_path,
-                format_run_summary_line(current_row_id, row["severity"], result_status, result_note),
+                format_run_summary_line(current_row_id, row["severity"], result_status, summary_note),
             )
 
             if args.max_rows is not None and len(rows_processed_this_run) >= args.max_rows:
@@ -1074,10 +1283,7 @@ def main():
         print(f"to resume (branch '{branch_name}' will be reused).")
         exit_code = 1
 
-    print()
-    print("=" * 60)
-    print("AUDIT FIX RUNNER -- POST-RUN")
-    print("=" * 60)
+    print_banner("AUDIT FIX RUNNER -- POST-RUN", color=TermColors.BLUE)
 
     final_rows = parse_master_tracking_table(audit_path)
     print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path)

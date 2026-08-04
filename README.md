@@ -42,6 +42,8 @@ much (and as little unrelated clutter) as session #1.
 - A project whose root folder contains an `AUDIT.md` file with a Master
   Tracking Table — a markdown table with a header row containing columns
   named `ID`, `Severity`, `Fix Status`, and (optionally) `Notes`
+- On macOS, this tool manages sleep prevention (`caffeinate`) automatically
+  for you, per row — no need to run `caffeinate` manually anymore
 
 ## Every argument, explained
 
@@ -52,6 +54,7 @@ much (and as little unrelated clutter) as session #1.
 | `--mode {manual,auto}` | No | `manual` | `manual`: pause after every row and wait for you to press Enter. `auto`: keep going automatically, only stopping at the end or on Ctrl+C. |
 | `--severities LIST` | No | all severities | Comma-separated list like `"P0,P1"` to only process rows of those severities this run. |
 | `--max-rows N` | No | no limit | Stop after processing N rows this run, as a safety valve. |
+| `--max-turns N` | No | `60` | Cap each row's Claude session at N agent turns, so a session that gets stuck (e.g. polling in a loop waiting on a slow command) fails fast and cleanly instead of silently running out of budget. |
 | `--test-cmd "CMD"` | No | none | The shell command that runs your project's full test suite, e.g. `"npm test"` or `"./gradlew testDebugUnitTest"`. Handed to each row's Claude session as the required verification step. If omitted, you'll be asked to type `yes` to confirm before continuing without one. |
 | `--dry-run` | No | off | Print the full plan (branch, row order, count) and exit without running anything. |
 
@@ -152,6 +155,18 @@ you which row it was about to start. This almost always means a previous
 row's session was interrupted mid-fix. Look at `git status` / `git diff`,
 decide whether to commit, stash, or discard those changes (and reset that
 row back to `Not started` in `AUDIT.md` if needed), then re-run.
+
+### Hitting the turn limit vs. being genuinely Blocked
+
+A row hitting `--max-turns` is a **distinct outcome** from a row being
+genuinely `Blocked` — it means the session ran out of turns, not that the
+finding was judged unfixable. If this happens the tool tells you clearly
+in the console output. The working tree may still be left dirty in that
+case (same as any other interrupted row), so the RESUME CHECK / dirty-tree
+safety rule above still applies before the next row can start — inspect
+`git status`/`git diff`, decide what to do with any partial work, and
+consider re-running that specific row by hand with a higher `--max-turns`
+before assuming it's simply a hard finding.
 
 ## A full example
 
