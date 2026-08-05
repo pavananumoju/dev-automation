@@ -54,6 +54,7 @@ much (and as little unrelated clutter) as session #1.
 | `--mode {manual,auto}` | No | `manual` | `manual`: pause after every row and wait for you to press Enter. `auto`: keep going automatically, only stopping at the end or on Ctrl+C. |
 | `--severities LIST` | No | all severities | Comma-separated list like `"P0,P1"` to only process rows of those severities this run. |
 | `--max-rows N` | No | no limit | Stop after processing N rows this run, as a safety valve. |
+| `--pause-every N` | No | auto (see below) | In `--mode manual`, pause for confirmation every N rows instead of every row. If not set, this is chosen automatically: no pausing if `--max-rows` is 2 or less, otherwise every 2 rows. |
 | `--max-turns N` | No | `60` | Cap each row's Claude session at N agent turns, so a session that gets stuck (e.g. polling in a loop waiting on a slow command) fails fast and cleanly instead of silently running out of budget. |
 | `--test-cmd "CMD"` | No | none | The shell command that runs your project's full test suite, e.g. `"npm test"` or `"./gradlew testDebugUnitTest"`. Handed to each row's Claude session as the required verification step. If omitted, you'll be asked to type `yes` to confirm before continuing without one. |
 | `--dry-run` | No | off | Print the full plan (branch, row order, count) and exit without running anything. |
@@ -136,8 +137,14 @@ my-app/
 
 You can stop at any point — the tool is designed so this is always safe:
 
-- **`--mode manual`** (the default) pauses after every row and asks you to
-  press Enter to continue, or type `q` to stop there.
+- **`--mode manual`** (the default) pauses and asks you to press Enter to
+  continue, or type `q` to stop there. By default it doesn't pause after
+  every single row: if `--max-rows` is 2 or less it doesn't pause at all
+  (it runs straight through to the end, or until a row fails/hangs), and
+  otherwise it pauses every 2 rows — override this with `--pause-every`.
+- `--auto-push` still pushes a `Fixed` row to origin right when that row
+  finishes, regardless of the pause interval — pausing only controls when
+  the tool asks for confirmation, it never delays or batches pushes.
 - **Ctrl+C** works at any time, including mid-row. The tool catches it,
   prints a friendly message, and exits cleanly — no raw Python traceback.
 - Either way, nothing is lost. `AUDIT.md` and your git history reflect

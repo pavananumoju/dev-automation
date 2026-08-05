@@ -168,6 +168,17 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--pause-every",
+        dest="pause_every",
+        type=int,
+        default=None,
+        help=(
+            "In --mode manual, pause for confirmation every N rows instead "
+            "of every row. If not set, this is chosen automatically: no "
+            "pausing if --max-rows is 2 or less, otherwise every 2 rows."
+        ),
+    )
+    parser.add_argument(
         "--max-turns",
         dest="max_turns",
         type=int,
@@ -755,6 +766,25 @@ def select_rows_to_process(rows, severities_filter, max_rows):
     return ordered_rows
 
 
+def compute_pause_interval(pause_every, max_rows):
+    """
+    Work out how often --mode manual should pause for confirmation, in
+    rows. Returns an int interval (pause after every Nth row completed
+    this run), or None if pausing should be disabled entirely (run
+    straight through, same as --mode auto, within this run's row limit).
+
+    If pause_every was explicitly given on the command line, it's used
+    as-is. Otherwise it's auto-derived: --max-rows of 2 or less disables
+    pausing; --max-rows of None or more than 2 pauses every 2 rows.
+    """
+    if pause_every is not None:
+        return pause_every
+
+    if max_rows is not None and max_rows <= 2:
+        return None
+    return 2
+
+
 def print_dry_run_plan(branch_name, ordered_rows):
     """Print what a real run would do, without doing any of it."""
     print("=" * 60)
@@ -1044,7 +1074,7 @@ def usage_check_banner_lines(label):
     color = TermColors.MAGENTA
     return [
         f"{color}{TermColors.BOLD}╔{'═' * (width - 2)}╗",
-        f"║ {title.center(width - 4)} ║",
+        f"║ {title.center(width - 4)}║",
         f"╚{'═' * (width - 2)}╝{TermColors.RESET}",
     ]
 
@@ -1491,6 +1521,7 @@ def send_mac_notification(message_text):
 
 def main():
     args = parse_arguments()
+    pause_interval = compute_pause_interval(args.pause_every, args.max_rows)
 
     print_banner("AUDIT FIX RUNNER -- PRE-FLIGHT", color=TermColors.BLUE)
 
@@ -1539,6 +1570,7 @@ def main():
     test_cmd_for_prompt = args.test_cmd or "(no test command was provided -- find and run the project's existing test suite yourself)"
 
     rows_processed_this_run = []
+    rows_since_last_pause = 0
     exit_code = 0
 
     if not should_run_loop:
@@ -1639,10 +1671,14 @@ def main():
                 print(f"\nReached --max-rows limit of {args.max_rows}. Stopping (not necessarily finished).")
                 break
 
-            if args.mode == "manual":
+            rows_since_last_pause += 1
+
+            if args.mode == "manual" and pause_interval is not None and rows_since_last_pause % pause_interval == 0:
                 user_choice = input(
-                    "\nPress Enter to continue to the next row, or type 'q' then Enter to stop here: "
+                    f"\n{rows_since_last_pause} row(s) completed since last pause. Press Enter to "
+                    "continue to the next batch, or type 'q' then Enter to stop here: "
                 )
+                rows_since_last_pause = 0
                 if user_choice.strip().lower().startswith("q"):
                     print("Stopping at your request.")
                     break
