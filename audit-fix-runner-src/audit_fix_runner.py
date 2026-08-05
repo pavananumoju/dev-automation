@@ -47,6 +47,11 @@ from pathlib import Path
 # processed last, in alphabetical order.
 SEVERITY_ORDER = ["P0", "P1", "P2", "P3"]
 
+# Width of the section/row banner boxes drawn by print_banner(), and of the
+# full-width dashed separator lines around the PROJECT.md/README.md preview
+# -- kept equal so those two visual elements line up with each other.
+BANNER_WIDTH = 100
+
 # Matches ANSI terminal escape codes (color codes, cursor movement, etc.)
 # so log files stay plain, readable text.
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -194,6 +199,31 @@ def parse_arguments():
             "running anything."
         ),
     )
+    parser.add_argument(
+        "--auto-push",
+        dest="auto_push",
+        action="store_true",
+        help=(
+            "After each row's session finishes and that row is confirmed "
+            "Fixed in AUDIT.md, automatically run `git push origin "
+            "<branch>` before moving to the next row. Off by default -- "
+            "rows that end up Blocked or still Not started are never "
+            "pushed, regardless of this flag. A failed push is reported "
+            "but does not stop the run, since the local commit is safe "
+            "either way."
+        ),
+    )
+    parser.add_argument(
+        "--usage-warn-threshold",
+        dest="usage_warn_threshold",
+        type=int,
+        default=90,
+        help=(
+            "Warn if Claude Code session or weekly usage is at or above N "
+            "percent before starting this run. Checked once, at the start "
+            "of the run (not per row). Default: 90."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -227,7 +257,13 @@ def print_project_context(project_path):
     Print the first ~15 lines of PROJECT.md (preferred) or README.md, if
     either exists, as an informational sanity check that this is the right
     project. This is not used programmatically anywhere else.
+
+    The whole section (including the no-preview-found fallback) is wrapped
+    in full-width dashed separator lines so it reads as one clearly bounded
+    block instead of blending into the rest of the pre-flight output.
     """
+    dashed_line = "-" * BANNER_WIDTH
+    print(dashed_line)
     print("Reading project context...")
     for filename in ["PROJECT.md", "README.md"]:
         candidate_path = project_path / filename
@@ -236,9 +272,11 @@ def print_project_context(project_path):
             file_text = candidate_path.read_text(errors="replace")
             for line in file_text.splitlines()[:15]:
                 print(line)
-            print("--- end of preview ---\n")
+            print("--- end of preview ---")
+            print(dashed_line + "\n")
             return
-    print("(No PROJECT.md or README.md found at the project root -- skipping preview.)\n")
+    print("(No PROJECT.md or README.md found at the project root -- skipping preview.)")
+    print(dashed_line + "\n")
 
 
 # ======================================================================
@@ -352,6 +390,27 @@ def confirm_remote_origin(project_path):
         )
     else:
         print("Git remote 'origin': found.")
+
+
+def push_branch_to_origin(project_path, branch_name):
+    """
+    Run `git push origin <branch_name>`. Prints a clear success or error
+    line either way. Never raises -- a failed push (network issue,
+    rejected, etc.) is reported but must not crash the run, since the
+    local commit is safe regardless.
+    """
+    succeeded, _stdout_text, stderr_text = run_git_command(
+        project_path, ["push", "origin", branch_name]
+    )
+    if succeeded:
+        print(f"{TermColors.GREEN}Pushed to origin/{branch_name}.{TermColors.RESET}")
+    else:
+        print(
+            f"{TermColors.RED}ERROR: git push to origin/{branch_name} failed -- "
+            f"continuing anyway, the local commit is still safe.{TermColors.RESET}"
+        )
+        if stderr_text:
+            print(stderr_text)
 
 
 def get_current_branch(project_path):
@@ -599,6 +658,37 @@ def severity_sort_key(severity):
     return (1, normalized_severity)
 
 
+def render_ascii_table(headers, rows, align=None):
+    """
+    Render a simple bordered ASCII table (box-drawing characters) given a
+    list of column header strings and a list of row tuples (cells are
+    stringified). Column widths are sized to the longest cell in each
+    column. align is an optional list of "left"/"right" per column,
+    defaulting to left for every column. Returns a list of lines to print.
+    """
+    if align is None:
+        align = ["left"] * len(headers)
+
+    all_rows = [headers] + [[str(cell) for cell in row] for row in rows]
+    column_widths = [max(len(row[i]) for row in all_rows) for i in range(len(headers))]
+
+    def build_separator(left, mid, right):
+        return left + mid.join("─" * (w + 2) for w in column_widths) + right
+
+    def build_row(cells):
+        padded_cells = [
+            (str(cell).rjust(w) if a == "right" else str(cell).ljust(w))
+            for cell, w, a in zip(cells, column_widths, align)
+        ]
+        return "│ " + " │ ".join(padded_cells) + " │"
+
+    lines = [build_separator("┌", "┬", "┐"), build_row(headers), build_separator("├", "┼", "┤")]
+    for row in rows:
+        lines.append(build_row(row))
+    lines.append(build_separator("└", "┴", "┘"))
+    return lines
+
+
 def summarize_rows(rows):
     """Print a console summary of the Master Tracking Table's current state."""
     total_count = len(rows)
@@ -607,19 +697,27 @@ def summarize_rows(rows):
     blocked_count = sum(1 for row in rows if status_matches(row["fix_status"], STATUS_BLOCKED))
     other_count = total_count - not_started_count - fixed_count - blocked_count
 
-    print(f"Master Tracking Table: {total_count} row(s) total")
-    print(f"  Not started: {not_started_count}")
-    print(f"  Fixed:       {fixed_count}")
-    print(f"  Blocked:     {blocked_count}")
+    print(f"Master Tracking Table: {total_count} row(s) total\n")
+
+    status_rows = [
+        ("Not started", not_started_count),
+        ("Fixed", fixed_count),
+        ("Blocked", blocked_count),
+    ]
     if other_count:
-        print(f"  Other status: {other_count}")
+        status_rows.append(("Other status", other_count))
+    for line in render_ascii_table(["Status", "Count"], status_rows, align=["left", "right"]):
+        print(line)
+    print()
 
     severities_seen = sorted(set(row["severity"] for row in rows), key=severity_sort_key)
-    print("  By severity:")
+    severity_rows = []
     for severity in severities_seen:
         count = sum(1 for row in rows if row["severity"] == severity)
         label = severity if severity else "(blank)"
-        print(f"    {label}: {count}")
+        severity_rows.append((label, count))
+    for line in render_ascii_table(["Severity", "Count"], severity_rows, align=["left", "right"]):
+        print(line)
     print()
 
 
@@ -679,6 +777,157 @@ def confirm_missing_test_command():
 
 
 # ======================================================================
+# LOOP: usage checking
+# ======================================================================
+
+def parse_claude_usage(output_text):
+    """
+    Extract 'Current session' and 'Current week' usage percentages from
+    the text output of `claude /usage`. Returns a dict with
+    session_percent, week_percent (ints or None), and session_reset,
+    week_reset (strings or None).
+    """
+    result = {
+        "session_percent": None,
+        "week_percent": None,
+        "session_reset": None,
+        "week_reset": None,
+    }
+    session_match = re.search(
+        r"Current session[:\s].*?(\d+)%\s*used"
+        r"(?:.*?resets\s+([^\n]+?)(?:\n|$))?",
+        output_text,
+        re.IGNORECASE,
+    )
+    if session_match:
+        result["session_percent"] = int(session_match.group(1))
+        if session_match.group(2):
+            result["session_reset"] = session_match.group(2).strip()
+    week_match = re.search(
+        r"Current week[^\n:]*[:\s].*?(\d+)%\s*used"
+        r"(?:.*?resets\s+([^\n]+?)(?:\n|$))?",
+        output_text,
+        re.IGNORECASE,
+    )
+    if week_match:
+        result["week_percent"] = int(week_match.group(1))
+        if week_match.group(2):
+            result["week_reset"] = week_match.group(2).strip()
+    return result
+
+
+def get_current_usage():
+    """
+    Runs `claude /usage` with output redirected (not a real terminal, so
+    it behaves non-interactively and exits cleanly) and parses the result.
+    Returns the same dict as parse_claude_usage(), or all-None values if
+    the command fails for any reason (never crash the main script over this).
+
+    Called exactly twice per script invocation -- once at command start
+    (before the LOOP begins) and once at command end (in POST-RUN) -- not
+    once per row. See display_usage_check(), run_start_usage_check(), and
+    run_end_usage_check() below.
+    """
+    try:
+        completed = subprocess.run(
+            ["claude", "/usage"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return parse_claude_usage(completed.stdout)
+    except Exception:
+        return parse_claude_usage("")
+
+
+def display_usage_check(label):
+    """
+    Fetch current usage and build (not print) the full usage-check block --
+    the USAGE-CHECK-START/END grep markers, the bordered banner, and both
+    colored bars -- for one command-level snapshot identified by label
+    (e.g. "BEFORE THIS RUN" or "AFTER THIS RUN").
+
+    Always builds the full block regardless of how high usage is -- there
+    is no threshold gate here. (The old per-row version only ever built
+    this block when a threshold was crossed, which in practice meant it
+    almost never appeared in a real run's console output; command-level
+    calls now always show it, once at the start and once at the end, so
+    the user gets a real "before" and "after" snapshot every run.)
+
+    Returns a tuple of (usage_dict, lines) -- usage_dict is the same shape
+    parse_claude_usage() returns, so callers can act on the percentages
+    without re-parsing the display lines.
+    """
+    usage = get_current_usage()
+    lines = ["--- USAGE-CHECK-START ---"]
+    lines.extend(usage_check_banner_lines(label))
+    if usage["session_percent"] is None and usage["week_percent"] is None:
+        lines.append("Could not retrieve Claude usage.")
+    else:
+        lines.append("Current session")
+        lines.append(
+            f"  {usage_bar_color(usage['session_percent'])}"
+            f"{render_usage_bar(usage['session_percent'])}{TermColors.RESET}"
+        )
+        if usage["session_reset"]:
+            lines.append(f"  Resets {usage['session_reset']}")
+        lines.append("Current week (all models)")
+        lines.append(
+            f"  {usage_bar_color(usage['week_percent'])}"
+            f"{render_usage_bar(usage['week_percent'])}{TermColors.RESET}"
+        )
+        if usage["week_reset"]:
+            lines.append(f"  Resets {usage['week_reset']}")
+    lines.append("--- USAGE-CHECK-END ---")
+    return usage, lines
+
+
+def run_start_usage_check(usage_warn_threshold, run_summary_path):
+    """
+    Display the "before this run" usage snapshot. Called exactly once per
+    script invocation, right after pre-flight finishes and before the LOOP
+    section begins -- always shown, not gated on the threshold.
+
+    If usage is already at or above usage_warn_threshold (session or
+    week), warns clearly and asks for y/N confirmation before the loop is
+    allowed to start at all. Returns True if the run should proceed, False
+    if the user declined.
+    """
+    usage, lines = display_usage_check("BEFORE THIS RUN")
+    for line in lines:
+        print(line)
+    append_lines_to_log(run_summary_path, lines)
+
+    session_percent = usage["session_percent"] or 0
+    week_percent = usage["week_percent"] or 0
+    if session_percent >= usage_warn_threshold or week_percent >= usage_warn_threshold:
+        usage_choice = input(
+            f"\nUsage is already at or above {usage_warn_threshold}% -- "
+            "start this run anyway? [y/N]: "
+        )
+        if usage_choice.strip().lower() != "y":
+            return False
+    print()
+    return True
+
+
+def run_end_usage_check(run_summary_path):
+    """
+    Display the "after this run" usage snapshot. Called exactly once per
+    script invocation, in POST-RUN after the loop has finished for any
+    reason (normal completion, --max-rows reached, manual stop, Ctrl+C, or
+    'claude' going missing). Purely informational -- never blocks or
+    prompts -- so the user can see how much usage this run actually
+    consumed.
+    """
+    _usage, lines = display_usage_check("AFTER THIS RUN")
+    for line in lines:
+        print(line)
+    append_lines_to_log(run_summary_path, lines)
+    print()
+
+
+# ======================================================================
 # LOOP: building and running one row's Claude session
 # ======================================================================
 
@@ -704,6 +953,18 @@ def build_row_log_path(logs_folder, row_id):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_row_id = row_id.replace("/", "-").replace(" ", "_")
     return logs_folder / f"{timestamp}_{safe_row_id}.log"
+
+
+def append_lines_to_log(log_path, lines):
+    """
+    Append plain text lines to a log file, ANSI-stripped, creating the file
+    if it doesn't exist yet. Used both for a row's own log file (for output
+    that happens before run_claude_session() opens log_path itself) and for
+    the run summary file (for the command-level usage-check snapshots).
+    """
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        for line in lines:
+            log_file.write(strip_ansi_codes(line) + "\n")
 
 
 # Tool names, as they appear in a stream-json tool_use block's "name"
@@ -734,10 +995,30 @@ class TermColors:
 
 def print_banner(title, color=TermColors.CYAN):
     """Prints a styled box banner around sections."""
-    width = 64
+    width = BANNER_WIDTH
     print(f"\n{color}{TermColors.BOLD}╔{'═' * (width - 2)}╗")
     print(f"║ {title.center(width - 4)} ║")
     print(f"╚{'═' * (width - 2)}╝{TermColors.RESET}\n")
+
+
+def usage_check_banner_lines(label):
+    """
+    Build (not print) the bordered banner lines for the usage-check block.
+    Magenta with a 📊 marker, so it's visually distinct at a glance from
+    both the blue section banners and the cyan per-row banners already in
+    use, and easy to spot in a long, noisy console/log.
+
+    label identifies which of the two command-level checks this is, e.g.
+    "BEFORE THIS RUN" or "AFTER THIS RUN" -- this is no longer per-row.
+    """
+    width = 64
+    title = f"📊 USAGE CHECK — {label}"
+    color = TermColors.MAGENTA
+    return [
+        f"{color}{TermColors.BOLD}╔{'═' * (width - 2)}╗",
+        f"║ {title.center(width - 4)} ║",
+        f"╚{'═' * (width - 2)}╝{TermColors.RESET}",
+    ]
 
 def short_path(file_path, project_path):
     """Truncates absolute paths relative to project root for cleaner output."""
@@ -748,6 +1029,31 @@ def short_path(file_path, project_path):
         return f"./{rel}"
     except ValueError:
         return str(file_path)
+
+
+def render_usage_bar(percent, width=40):
+    """
+    Renders a filled progress bar like: '███████████████▌    31% used'
+    percent: 0-100 (int). width: total character width of the bar itself.
+    """
+    if percent is None:
+        return "(unknown)"
+    filled = int((percent / 100) * width)
+    half_block = "▌" if (percent / 100 * width) - filled >= 0.5 else ""
+    bar = ("█" * filled) + half_block
+    bar = bar.ljust(width)
+    return f"{bar} {percent}% used"
+
+
+def usage_bar_color(percent):
+    """Pick a TermColors color for a usage percentage: green/yellow/red."""
+    if percent is None:
+        return TermColors.RESET
+    if percent >= 90:
+        return TermColors.RED
+    if percent >= 70:
+        return TermColors.YELLOW
+    return TermColors.GREEN
 
 
 def console_line_for_tool_use(tool_name, tool_input, project_path):
@@ -911,6 +1217,11 @@ def run_claude_session(prompt, project_path, log_path, max_turns):
     complete, unabridged record even though the console only shows short
     summaries. stderr is captured too.
 
+    log_path is opened in append mode, not write/truncate: by the time
+    this function runs, the caller may have already written the row's
+    usage-check block to the same file (see append_lines_to_log()), and
+    that content must be preserved, not wiped out.
+
     A `caffeinate -dim` process is started for the duration of this row's
     session only (so the Mac can't sleep mid-fix or mid-test-run) and is
     always stopped before this function returns or raises -- normal
@@ -966,7 +1277,7 @@ def run_claude_session(prompt, project_path, log_path, max_turns):
         hit_turn_limit = False
         saw_result_event = False
 
-        with open(log_path, "w", encoding="utf-8") as log_file:
+        with open(log_path, "a", encoding="utf-8") as log_file:
             try:
                 for line in process.stdout:
                     clean_line = strip_ansi_codes(line)
@@ -1020,6 +1331,7 @@ def initialize_run_summary_file(run_summary_path, project_path, branch_name, arg
         f"- Test command: {args.test_cmd or '(none provided)'}",
         f"- Severities filter: {args.severities or '(all)'}",
         f"- Max rows this run: {args.max_rows if args.max_rows is not None else '(no limit)'}",
+        f"- Auto-push: {'on' if args.auto_push else 'off'}",
         f"- Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "## Rows processed",
@@ -1045,7 +1357,7 @@ def append_to_run_summary_file(run_summary_path, line_text):
 # POST-RUN
 # ======================================================================
 
-def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path):
+def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path, auto_push=False):
     """Print the end-of-run summary to the console."""
     total_fixed = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
@@ -1060,14 +1372,21 @@ def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_su
     print(f"Total still Not started: {total_not_started}")
     print()
     print(f"Branch: {branch_name}")
-    print("Nothing was pushed. Review before pushing yourself, e.g.:")
+    if auto_push:
+        print(
+            "--auto-push was on: each row that finished Fixed was pushed to "
+            "origin as it completed. Blocked/Not started rows were never "
+            "pushed. Review with:"
+        )
+    else:
+        print("Nothing was pushed. Review before pushing yourself, e.g.:")
     print("  git log")
     print(f"  git diff main..{branch_name}")
     print()
     print(f"Full run log: {run_summary_path}")
 
 
-def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name):
+def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name, auto_push=False):
     """Append the end-of-run summary to the run summary file (never overwrite it)."""
     total_fixed = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
@@ -1086,7 +1405,8 @@ def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_th
         note_suffix = f" -- {row['notes']}" if row["notes"] else ""
         summary_lines.append(f"    - {row['id']}{note_suffix}")
     summary_lines.append(f"- Total still Not started: {total_not_started}")
-    summary_lines.append(f"- Branch: {branch_name} (not pushed)")
+    branch_suffix = "auto-pushed Fixed rows as they completed" if auto_push else "not pushed"
+    summary_lines.append(f"- Branch: {branch_name} ({branch_suffix})")
 
     with open(run_summary_path, "a", encoding="utf-8") as summary_file:
         summary_file.write("\n".join(summary_lines) + "\n")
@@ -1159,20 +1479,25 @@ def main():
         print("No 'Not started' rows match your filters. Nothing to do.")
         sys.exit(0)
 
-    print_banner("AUDIT FIX RUNNER -- LOOP", color=TermColors.BLUE)
-
     logs_folder = ensure_logs_folder(project_path)
     start_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_summary_path = logs_folder / f"run_summary_{start_timestamp}.md"
     initialize_run_summary_file(run_summary_path, project_path, branch_name, args)
+
+    should_run_loop = run_start_usage_check(args.usage_warn_threshold, run_summary_path)
+
+    print_banner("AUDIT FIX RUNNER -- LOOP", color=TermColors.BLUE)
 
     test_cmd_for_prompt = args.test_cmd or "(no test command was provided -- find and run the project's existing test suite yourself)"
 
     rows_processed_this_run = []
     exit_code = 0
 
+    if not should_run_loop:
+        print("Stopping at your request -- usage was already at or above the warning threshold.\n")
+
     try:
-        for position, row in enumerate(ordered_rows, start=1):
+        for position, row in enumerate(ordered_rows if should_run_loop else [], start=1):
             # Track which row is being worked on *before* touching git or
             # starting the subprocess, so any error can name this row.
             current_row_id = row["id"]
@@ -1182,9 +1507,10 @@ def main():
             print_banner(f"Row {position}/{len(ordered_rows)}: {current_row_id} ({row['severity']})")
             print(f"Rows completed so far this run: {len(rows_processed_this_run)}")
 
+            log_path = build_row_log_path(logs_folder, current_row_id)
+
             prompt = build_prompt(current_row_id, branch_name, test_cmd_for_prompt)
 
-            log_path = build_row_log_path(logs_folder, current_row_id)
             print(f"Starting Claude session. Logging to: {log_path}\n")
 
             returncode, hit_turn_limit, saw_result_event = run_claude_session(
@@ -1225,6 +1551,9 @@ def main():
                     "slept despite caffeinate, or an external supervisor/timeout. This is "
                     f"NOT a sign the fix was hard.{TermColors.RESET}"
                 )
+
+            if args.auto_push and status_matches(result_status, STATUS_FIXED):
+                push_branch_to_origin(project_path, branch_name)
 
             if status_matches(result_status, STATUS_NOT_STARTED):
                 if hit_turn_limit:
@@ -1285,9 +1614,11 @@ def main():
 
     print_banner("AUDIT FIX RUNNER -- POST-RUN", color=TermColors.BLUE)
 
+    run_end_usage_check(run_summary_path)
+
     final_rows = parse_master_tracking_table(audit_path)
-    print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path)
-    append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name)
+    print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path, auto_push=args.auto_push)
+    append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name, auto_push=args.auto_push)
     send_mac_notification(build_notification_text(rows_processed_this_run, final_rows))
 
     sys.exit(exit_code)

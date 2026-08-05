@@ -57,6 +57,7 @@ much (and as little unrelated clutter) as session #1.
 | `--max-turns N` | No | `60` | Cap each row's Claude session at N agent turns, so a session that gets stuck (e.g. polling in a loop waiting on a slow command) fails fast and cleanly instead of silently running out of budget. |
 | `--test-cmd "CMD"` | No | none | The shell command that runs your project's full test suite, e.g. `"npm test"` or `"./gradlew testDebugUnitTest"`. Handed to each row's Claude session as the required verification step. If omitted, you'll be asked to type `yes` to confirm before continuing without one. |
 | `--dry-run` | No | off | Print the full plan (branch, row order, count) and exit without running anything. |
+| `--auto-push` | No | off | After each row's session finishes and that row is confirmed `Fixed` in `AUDIT.md`, automatically run `git push origin <branch>` before moving to the next row. Rows that end up `Blocked` or still `Not started` are never pushed. A failed push (network issue, rejected, etc.) is reported but doesn't stop the run — the local commit is safe either way. With `--auto-push` off (the default), **nothing is ever pushed automatically** — you review and push yourself. |
 
 ### Examples
 
