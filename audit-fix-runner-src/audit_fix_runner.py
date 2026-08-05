@@ -642,6 +642,17 @@ def status_matches(status_text, target_status):
     return status_text.strip().lower() == target_status.strip().lower()
 
 
+def status_is_fixed(status_text):
+    """
+    True for any status starting with "Fixed" -- bare "Fixed" as well as
+    annotated variants like "Fixed (verified)" and "Fixed (unverified)".
+    Case-insensitive, ignoring surrounding whitespace. Does NOT match
+    "Partially fixed ..." (that's a different status, not a "Fixed"
+    prefix) -- those stay counted under "Other status".
+    """
+    return status_text.strip().lower().startswith(STATUS_FIXED.strip().lower())
+
+
 def find_row_by_id(rows, row_id):
     """Find a row dict by its id, matching case-insensitively."""
     for row in rows:
@@ -693,7 +704,7 @@ def summarize_rows(rows):
     """Print a console summary of the Master Tracking Table's current state."""
     total_count = len(rows)
     not_started_count = sum(1 for row in rows if status_matches(row["fix_status"], STATUS_NOT_STARTED))
-    fixed_count = sum(1 for row in rows if status_matches(row["fix_status"], STATUS_FIXED))
+    fixed_count = sum(1 for row in rows if status_is_fixed(row["fix_status"]))
     blocked_count = sum(1 for row in rows if status_matches(row["fix_status"], STATUS_BLOCKED))
     other_count = total_count - not_started_count - fixed_count - blocked_count
 
@@ -840,7 +851,7 @@ def get_current_usage():
         return parse_claude_usage("")
 
 
-def display_usage_check(label):
+def display_usage_check(label, before_usage=None):
     """
     Fetch current usage and build (not print) the full usage-check block --
     the USAGE-CHECK-START/END grep markers, the bordered banner, and both
@@ -853,6 +864,10 @@ def display_usage_check(label):
     almost never appeared in a real run's console output; command-level
     calls now always show it, once at the start and once at the end, so
     the user gets a real "before" and "after" snapshot every run.)
+
+    If before_usage is given (the dict returned by an earlier
+    run_start_usage_check() call), a "(+N% this run)" delta line is added
+    under each bar comparing it against this snapshot.
 
     Returns a tuple of (usage_dict, lines) -- usage_dict is the same shape
     parse_claude_usage() returns, so callers can act on the percentages
@@ -869,6 +884,10 @@ def display_usage_check(label):
             f"  {usage_bar_color(usage['session_percent'])}"
             f"{render_usage_bar(usage['session_percent'])}{TermColors.RESET}"
         )
+        if before_usage:
+            delta_line = format_usage_delta_line(before_usage.get("session_percent"), usage["session_percent"])
+            if delta_line:
+                lines.append(delta_line)
         if usage["session_reset"]:
             lines.append(f"  Resets {usage['session_reset']}")
         lines.append("Current week (all models)")
@@ -876,6 +895,10 @@ def display_usage_check(label):
             f"  {usage_bar_color(usage['week_percent'])}"
             f"{render_usage_bar(usage['week_percent'])}{TermColors.RESET}"
         )
+        if before_usage:
+            delta_line = format_usage_delta_line(before_usage.get("week_percent"), usage["week_percent"])
+            if delta_line:
+                lines.append(delta_line)
         if usage["week_reset"]:
             lines.append(f"  Resets {usage['week_reset']}")
     lines.append("--- USAGE-CHECK-END ---")
@@ -890,8 +913,10 @@ def run_start_usage_check(usage_warn_threshold, run_summary_path):
 
     If usage is already at or above usage_warn_threshold (session or
     week), warns clearly and asks for y/N confirmation before the loop is
-    allowed to start at all. Returns True if the run should proceed, False
-    if the user declined.
+    allowed to start at all. Returns a tuple of (should_run, usage) --
+    should_run is True if the run should proceed, False if the user
+    declined; usage is the dict from display_usage_check(), so the caller
+    can hand it to run_end_usage_check() later for a before/after delta.
     """
     usage, lines = display_usage_check("BEFORE THIS RUN")
     for line in lines:
@@ -906,12 +931,12 @@ def run_start_usage_check(usage_warn_threshold, run_summary_path):
             "start this run anyway? [y/N]: "
         )
         if usage_choice.strip().lower() != "y":
-            return False
+            return False, usage
     print()
-    return True
+    return True, usage
 
 
-def run_end_usage_check(run_summary_path):
+def run_end_usage_check(run_summary_path, before_usage=None):
     """
     Display the "after this run" usage snapshot. Called exactly once per
     script invocation, in POST-RUN after the loop has finished for any
@@ -919,8 +944,11 @@ def run_end_usage_check(run_summary_path):
     'claude' going missing). Purely informational -- never blocks or
     prompts -- so the user can see how much usage this run actually
     consumed.
+
+    before_usage, if given (the usage dict returned by run_start_usage_check()),
+    is used to print a "(+N% this run)" delta line under each bar.
     """
-    _usage, lines = display_usage_check("AFTER THIS RUN")
+    _usage, lines = display_usage_check("AFTER THIS RUN", before_usage=before_usage)
     for line in lines:
         print(line)
     append_lines_to_log(run_summary_path, lines)
@@ -1054,6 +1082,26 @@ def usage_bar_color(percent):
     if percent >= 70:
         return TermColors.YELLOW
     return TermColors.GREEN
+
+
+def format_usage_delta_line(before_percent, after_percent):
+    """
+    Build a "(+N% this run)" line comparing a before/after usage percentage,
+    or None if either side is unavailable. Flagged YELLOW/RED when the run
+    burned through more than ~10%/~20% in one go, so an expensive row stands
+    out at a glance; default color otherwise.
+    """
+    if before_percent is None or after_percent is None:
+        return None
+    delta = after_percent - before_percent
+    sign = "+" if delta >= 0 else ""
+    if abs(delta) >= 20:
+        color = TermColors.RED
+    elif abs(delta) > 10:
+        color = TermColors.YELLOW
+    else:
+        color = TermColors.RESET
+    return f"  {color}({sign}{delta}% this run){TermColors.RESET}"
 
 
 def console_line_for_tool_use(tool_name, tool_input, project_path):
@@ -1359,7 +1407,7 @@ def append_to_run_summary_file(run_summary_path, line_text):
 
 def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path, auto_push=False):
     """Print the end-of-run summary to the console."""
-    total_fixed = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED))
+    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
     total_not_started = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_NOT_STARTED))
 
@@ -1388,7 +1436,7 @@ def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_su
 
 def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name, auto_push=False):
     """Append the end-of-run summary to the run summary file (never overwrite it)."""
-    total_fixed = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED))
+    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
     total_not_started = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_NOT_STARTED))
 
@@ -1414,7 +1462,7 @@ def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_th
 
 def build_notification_text(rows_processed_this_run, final_rows):
     """Build a short one-line summary for the macOS notification."""
-    total_fixed = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED))
+    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
     total_blocked = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED))
     return (
         f"Processed {len(rows_processed_this_run)} row(s). "
@@ -1484,7 +1532,7 @@ def main():
     run_summary_path = logs_folder / f"run_summary_{start_timestamp}.md"
     initialize_run_summary_file(run_summary_path, project_path, branch_name, args)
 
-    should_run_loop = run_start_usage_check(args.usage_warn_threshold, run_summary_path)
+    should_run_loop, before_usage = run_start_usage_check(args.usage_warn_threshold, run_summary_path)
 
     print_banner("AUDIT FIX RUNNER -- LOOP", color=TermColors.BLUE)
 
@@ -1614,7 +1662,7 @@ def main():
 
     print_banner("AUDIT FIX RUNNER -- POST-RUN", color=TermColors.BLUE)
 
-    run_end_usage_check(run_summary_path)
+    run_end_usage_check(run_summary_path, before_usage=before_usage)
 
     final_rows = parse_master_tracking_table(audit_path)
     print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path, auto_push=args.auto_push)
