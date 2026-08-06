@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
 """
-Audit Fix Runner
-================
+Audit Verify Runner
+====================
 
-This tool automates working through a project's AUDIT.md file.
+This tool automates VERIFYING a project's already-fixed AUDIT.md rows --
+the companion to audit_fix_runner.py, which implements fixes in the first
+place. It never implements a fix from scratch; it confirms one already
+implemented actually holds up.
 
 AUDIT.md is expected to contain a "Master Tracking Table": a markdown table
 that lists findings/features, one per row, with a "Fix Status" column. This
-script finds every row whose status is "Not started" and works through them
-one at a time. For each row, it starts a brand-new, memory-free headless
-Claude Code session (`claude -p ...`). That session reads AUDIT.md itself,
-implements the fix, writes a test, runs the project's test suite, commits
-if everything passes, and updates its own row in AUDIT.md.
+script finds every row whose status contains "unverified" (e.g.
+"Fixed (unverified)", "Partially fixed (unverified)") and works through
+them one at a time. For each row, it starts a brand-new, memory-free
+headless Claude Code session (`claude -p ...`). That session reads
+AUDIT.md itself, confirms the described fix is actually present and
+correct in the current source, runs (or writes, if missing) a test for it
+-- including an on-device instrumented test on an emulator when the
+finding has any on-screen or interactive effect -- and updates its own row
+to "Fixed (verified)" if it holds up, or "Blocked" with a clear reason if
+it doesn't.
 
 This script is only an orchestrator. It never edits source code and never
-edits AUDIT.md itself -- it only reads AUDIT.md to decide what is left to do
-and to report progress. All the real work happens inside each `claude -p`
-session.
+edits AUDIT.md itself -- it only reads AUDIT.md to decide what is left to
+verify and to report progress. All the real work happens inside each
+`claude -p` session.
 
 Because every row gets a completely fresh Claude session, context never
 dilutes across a long run of many findings.
 
+Never run this at the same time as audit_fix_runner.py against the same
+project -- both touch the same working tree, branch, and commit history.
+This script checks for a live audit_fix_runner.py before starting and
+refuses to run if one is found; run one at a time.
+
 Example:
-    python3 audit_fix_runner.py \\
+    python3 audit_verify_runner.py \\
         --project ~/code/my-app \\
         --test-cmd "npm test" \\
         --mode auto
@@ -61,6 +74,7 @@ ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 STATUS_NOT_STARTED = "Not started"
 STATUS_FIXED = "Fixed"
+STATUS_FIXED_VERIFIED = "Fixed (verified)"
 STATUS_BLOCKED = "Blocked"
 
 
@@ -74,97 +88,107 @@ class ClaudeNotFoundError(Exception):
 # The prompt sent to each row's fresh `claude -p` session. Filled in with
 # .format(row_id=..., branch_name=..., test_cmd=...) before use.
 PROMPT_TEMPLATE = """Read AUDIT.md at the repo root. Find row {row_id} in the Master Tracking
-Table. Read that finding's full entry in its phase section, and open the
-actual source file(s) it cites. Do not rely on any other session's
-context -- read everything fresh.
+Table. Its Fix Status is expected to contain "unverified". Read that
+finding's full entry in its phase section, and read its current Notes
+column carefully -- it describes what a previous session believed it
+changed. Do not trust that description blindly: confirm it against the
+actual current source, which may have moved or changed since. Do not rely
+on any other session's context -- read everything fresh.
 
 You are on git branch {branch_name}. Confirm this with `git branch --show-
 current` before doing anything else; if you are not on that branch, stop
 and report the mismatch instead of proceeding.
 
-Implement the fix for {row_id}.
+Your job is to VERIFY {row_id}, not to redesign or rewrite its fix.
 
-Write a test that fails against the old behavior and passes with the fix.
-This is required, not optional.
+1. Read every source file the row's Notes/phase entry cites. Confirm the
+   described change is actually present and looks correct for the
+   finding described. If it is missing, or looks wrong or incomplete, a
+   small, obviously-correct completion of the existing fix is fine -- but
+   if it needs a real redesign, stop there and report that instead of
+   guessing or rewriting it from scratch.
 
-Run the full test suite with: {test_cmd}
-Every test must pass, not just the new one.
+2. Check whether a dedicated test for this fix already exists (the Notes
+   column usually names it). If one exists, run it. If it's missing, or
+   doesn't actually exercise the behavior the finding describes, write
+   one -- a test that would fail against the pre-fix behavior and passes
+   now.
 
-If this fix breaks something else, fix that too before finishing, and
-note what broke and how it was fixed.
+3. Run the full test suite with: {test_cmd}
+   Every test must pass, not just this row's.
 
-If a design-system or 'Approved Values' section exists in AUDIT.md and
-this finding relates to it (colors, spacing, motion, typography, etc.),
-use only those values. Do not invent new ones.
+4. If a design-system or 'Approved Values' section exists in AUDIT.md and
+   this finding relates to it (colors, spacing, motion, typography,
+   etc.), use only those values. Do not invent new ones.
 
-After the unit suite passes, decide whether {row_id}'s finding has any
-on-screen or interactive effect (a color, a layout, an animation, a
-tap/gesture outcome, text a user would see) as opposed to a purely
-internal change (calculation, storage, threading, timing with no visible
-surface).
+5. Decide whether {row_id}'s finding has any on-screen or interactive
+   effect (a color, a layout, an animation, a tap/gesture outcome, text a
+   user would see) as opposed to a purely internal change (calculation,
+   storage, threading, timing with no visible surface).
 
-If it's purely internal: skip on-device verification and say so in one
-clause in the Notes -- don't spend time on an emulator test that can't
-observe anything the unit suite doesn't already cover.
+   If it's purely internal: on-device verification doesn't apply here --
+   say so in one clause in the Notes and rely on the check above.
 
-If it does have an observable effect, verify it for real on-device
-before deciding Fixed or Blocked:
+   If it does have an observable effect, verify it for real on-device:
 
-1. Run `adb devices -l`. If it lists anything other than exactly one
-   emulator (e.g. a real device is attached), skip on-device
-   verification, note in AUDIT.md that it was skipped because a real
-   device was present, and fall back to the unit-test-only result.
-   Never run instrumented tests when a real device is connected.
+   a. Run `adb devices -l`. If it lists anything other than exactly one
+      emulator (e.g. a real device is attached), skip on-device
+      verification, note in AUDIT.md that it was skipped because a real
+      device was present, and fall back to the unit-test-only result.
+      Never run instrumented tests when a real device is connected.
 
-2. If no emulator is listed, boot one:
-   ~/Library/Android/sdk/emulator/emulator -avd Pixel_3a_API_34_extension_level_7_arm64-v8a -no-snapshot &
-   Then poll `adb shell getprop sys.boot_completed` every few seconds
-   (up to ~2 minutes) until it returns 1.
+   b. Write or extend a Compose UI test under app/src/androidTest/...,
+      matching the pattern in
+      app/src/androidTest/java/com/capitalrecall/app/ui/components/CompletionOverlayTest.kt:
+      - Host the affected composable directly via composeRule.setContent(...)
+        where possible, rather than the full app/ViewModel/navigation
+        graph -- only go through the real screen if the fix can't be
+        observed any other way.
+      - For a color/visual fix: capture the node with
+        captureToImage().asAndroidBitmap().getPixel(x, y) and assert
+        against the expected value with a small tolerance. Sample a point
+        well inside any padding() on that node, not near its edge -- a
+        node's captured bounds include its own padding, not just its
+        visible painted area; dump a debug screenshot to a file and pull
+        it via adb if you're not sure where the paint boundary actually
+        is before picking coordinates.
+      - For an interaction fix: drive the real click/gesture and assert
+        the resulting state or callback fired, not just that nothing
+        crashed.
 
-3. Write or extend a Compose UI test under app/src/androidTest/...,
-   matching the pattern in
-   app/src/androidTest/java/com/capitalrecall/app/ui/components/CompletionOverlayTest.kt:
-   - Host the affected composable directly via composeRule.setContent(...)
-     where possible, rather than the full app/ViewModel/navigation
-     graph -- only go through the real screen if the fix can't be
-     observed any other way.
-   - For a color/visual fix: capture the node with
-     captureToImage().asAndroidBitmap().getPixel(x, y) and assert
-     against the expected value with a small tolerance. Sample a point
-     well inside any padding() on that node, not near its edge -- a
-     node's captured bounds include its own padding, not just its
-     visible painted area; dump a debug screenshot to a file and pull
-     it via adb if you're not sure where the paint boundary actually is
-     before picking coordinates.
-   - For an interaction fix: drive the real click/gesture and assert
-     the resulting state or callback fired, not just that nothing
-     crashed.
+   c. Run only that test class:
+      ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=<fully.qualified.TestClassName>
 
-4. Run only that test class:
-   ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=<fully.qualified.TestClassName>
-
-5. A failure here is treated exactly like a unit test failure: fix the
-   underlying issue (never the test) or mark the row Blocked with why.
-   Do not leave a failing on-device test uncommitted-but-unmentioned.
+   d. A failure here is treated exactly like a unit test failure: fix the
+      underlying issue (never the test) or mark the row Blocked with why.
+      Do not leave a failing on-device test uncommitted-but-unmentioned.
 
 Never weaken or delete an existing test's assertion just to make it pass.
 If a test looks wrong, say so in your notes instead of editing it away.
 
-If everything passes: commit with a message referencing {row_id}, and
-update AUDIT.md's Master Tracking Table row for {row_id} yourself -- set
-Fix Status to 'Fixed', add the commit hash, and add one plain-language
-sentence in Notes about what changed. Say explicitly how it was
-verified: name the on-device test class and what it checked if you ran
-one, or say the verification was unit-test-only (and why: purely
-internal change, or a real device was attached) if you did not. Do not
-push.
+Decide the outcome:
 
-If it does not pass: do not commit. Update the same row instead -- set Fix
-Status to 'Blocked' and add a one-line reason in Notes.
+- Everything checks out (the fix is real, tests pass, on-device
+  verification passed or was correctly not applicable): update AUDIT.md's
+  row for {row_id} -- set Fix Status to 'Fixed (verified)', and rewrite
+  the Notes to state plainly what you verified and how (name the test
+  class(es), what they check, and whether on-device verification ran or
+  was skipped and why). Commit only if you actually changed something (a
+  new/extended test, or a small completion of the existing fix) with a
+  message referencing {row_id}. If you made no code changes at all
+  (the existing fix and its test were already complete and correct),
+  commit nothing except the AUDIT.md update itself.
+
+- The fix is missing, wrong, or incomplete in a way you should not
+  unilaterally redesign: set Fix Status to 'Blocked', and in Notes
+  explain precisely what's wrong with the existing fix and why it needs a
+  real second pass. Do not commit any half-fix.
+
+Do not push.
 
 End your response with a single clear line stating the row ID and whether
-it is now Fixed or Blocked, so this can be confirmed by re-reading the
-file."""
+it is now 'Fixed (verified)' or 'Blocked', so this can be confirmed by
+re-reading the file."""
 
 
 # ======================================================================
@@ -174,11 +198,14 @@ file."""
 def parse_arguments():
     """Define and parse every command-line argument this tool accepts."""
     parser = argparse.ArgumentParser(
-        prog="audit_fix_runner.py",
+        prog="audit_verify_runner.py",
         description=(
             "Work through a project's AUDIT.md Master Tracking Table one row "
-            "at a time. Each 'Not started' row is handled by its own fresh, "
-            "memory-free headless Claude Code session."
+            "at a time, verifying rows whose Fix Status contains "
+            "'unverified'. Each row is handled by its own fresh, "
+            "memory-free headless Claude Code session, which confirms the "
+            "existing fix actually holds up (writing/running a test, incl. "
+            "on-device where applicable) rather than reimplementing it."
         ),
     )
 
@@ -291,12 +318,12 @@ def parse_arguments():
         action="store_true",
         help=(
             "After each row's session finishes and that row is confirmed "
-            "Fixed in AUDIT.md, automatically run `git push origin "
-            "<branch>` before moving to the next row. Off by default -- "
-            "rows that end up Blocked or still Not started are never "
-            "pushed, regardless of this flag. A failed push is reported "
-            "but does not stop the run, since the local commit is safe "
-            "either way."
+            "'Fixed (verified)' in AUDIT.md, automatically run `git push "
+            "origin <branch>` before moving to the next row. Off by "
+            "default -- rows that end up Blocked or still unverified are "
+            "never pushed, regardless of this flag. A failed push is "
+            "reported but does not stop the run, since the local commit "
+            "is safe either way."
         ),
     )
     parser.add_argument(
@@ -460,7 +487,8 @@ def confirm_clean_working_tree(project_path, current_row_id=None):
         print("Inspect `git status` and `git diff` before re-running.")
         print(
             "Commit, stash, or discard the changes yourself (and, if needed, reset "
-            "that row back to 'Not started' in AUDIT.md), then run this tool again."
+            "that row's Fix Status back to an 'unverified' state in AUDIT.md), then "
+            "run this tool again."
         )
         sys.exit(1)
 
@@ -776,6 +804,18 @@ def status_is_fixed(status_text):
     return status_text.strip().lower().startswith(STATUS_FIXED.strip().lower())
 
 
+def status_is_unverified(status_text):
+    """
+    True for any status containing "unverified", regardless of what it
+    starts with -- catches "Fixed (unverified)", "Partially fixed
+    (unverified)", and any other future variant, since the word itself
+    (not a fixed prefix list) is what actually signals "needs a
+    verification pass". Case-insensitive, ignoring surrounding
+    whitespace.
+    """
+    return "unverified" in status_text.strip().lower()
+
+
 def find_row_by_id(rows, row_id):
     """Find a row dict by its id, matching case-insensitively."""
     for row in rows:
@@ -830,6 +870,7 @@ def summarize_rows(rows):
     fixed_count = sum(1 for row in rows if status_is_fixed(row["fix_status"]))
     blocked_count = sum(1 for row in rows if status_matches(row["fix_status"], STATUS_BLOCKED))
     other_count = total_count - not_started_count - fixed_count - blocked_count
+    unverified_count = sum(1 for row in rows if status_is_unverified(row["fix_status"]))
 
     print(f"Master Tracking Table: {total_count} row(s) total\n")
 
@@ -843,6 +884,7 @@ def summarize_rows(rows):
     for line in render_ascii_table(["Status", "Count"], status_rows, align=["left", "right"]):
         print(line)
     print()
+    print(f"Rows needing verification (status contains 'unverified'): {unverified_count}\n")
 
     severities_seen = sorted(set(row["severity"] for row in rows), key=severity_sort_key)
     severity_rows = []
@@ -858,19 +900,19 @@ def summarize_rows(rows):
 def select_rows_to_process(rows, severities_filter, max_rows):
     """
     Build the ordered list of rows this run will process: only rows whose
-    status is exactly "Not started", optionally restricted to specific
+    status contains "unverified", optionally restricted to specific
     severities, sorted P0 first (ties keep the table's original order),
     optionally capped at max_rows.
     """
-    not_started_rows = [row for row in rows if status_matches(row["fix_status"], STATUS_NOT_STARTED)]
+    unverified_rows = [row for row in rows if status_is_unverified(row["fix_status"])]
 
     if severities_filter:
         allowed_severities = set(severity.strip().upper() for severity in severities_filter)
-        not_started_rows = [row for row in not_started_rows if row["severity"] in allowed_severities]
+        unverified_rows = [row for row in unverified_rows if row["severity"] in allowed_severities]
 
     # Python's sort() is stable, so rows that share a severity keep their
     # original order from the table.
-    ordered_rows = sorted(not_started_rows, key=lambda row: severity_sort_key(row["severity"]))
+    ordered_rows = sorted(unverified_rows, key=lambda row: severity_sort_key(row["severity"]))
 
     if max_rows is not None:
         ordered_rows = ordered_rows[:max_rows]
@@ -1663,7 +1705,7 @@ def run_claude_session(prompt, project_path, log_path, max_turns):
 def initialize_run_summary_file(run_summary_path, project_path, branch_name, args):
     """Create the run summary markdown file and write its header section."""
     header_lines = [
-        "# Audit Fix Runner -- Run Summary",
+        "# Audit Verify Runner -- Run Summary",
         "",
         f"- Project: {project_path}",
         f"- Branch: {branch_name}",
@@ -1699,24 +1741,24 @@ def append_to_run_summary_file(run_summary_path, line_text):
 
 def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_summary_path, auto_push=False):
     """Print the end-of-run summary to the console."""
-    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
+    total_verified = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED_VERIFIED))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
-    total_not_started = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_NOT_STARTED))
+    total_still_unverified = sum(1 for row in final_rows if status_is_unverified(row["fix_status"]))
 
-    print(f"Rows processed this run: {len(rows_processed_this_run)}")
-    print(f"Total Fixed (all time):  {total_fixed}")
-    print(f"Total Blocked:           {len(blocked_rows)}")
+    print(f"Rows processed this run:        {len(rows_processed_this_run)}")
+    print(f"Total Fixed (verified, all time): {total_verified}")
+    print(f"Total Blocked:                   {len(blocked_rows)}")
     for row in blocked_rows:
         note_suffix = f" -- {row['notes']}" if row["notes"] else ""
         print(f"    {row['id']}{note_suffix}")
-    print(f"Total still Not started: {total_not_started}")
+    print(f"Total still unverified:          {total_still_unverified}")
     print()
     print(f"Branch: {branch_name}")
     if auto_push:
         print(
-            "--auto-push was on: each row that finished Fixed was pushed to "
-            "origin as it completed. Blocked/Not started rows were never "
-            "pushed. Review with:"
+            "--auto-push was on: each row that finished 'Fixed (verified)' was "
+            "pushed to origin as it completed. Blocked/still-unverified rows "
+            "were never pushed. Review with:"
         )
     else:
         print("Nothing was pushed. Review before pushing yourself, e.g.:")
@@ -1728,9 +1770,9 @@ def print_final_summary(final_rows, rows_processed_this_run, branch_name, run_su
 
 def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_this_run, branch_name, auto_push=False):
     """Append the end-of-run summary to the run summary file (never overwrite it)."""
-    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
+    total_verified = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED_VERIFIED))
     blocked_rows = [row for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED)]
-    total_not_started = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_NOT_STARTED))
+    total_still_unverified = sum(1 for row in final_rows if status_is_unverified(row["fix_status"]))
 
     summary_lines = [
         "",
@@ -1738,14 +1780,14 @@ def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_th
         "",
         f"- Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Rows processed this run: {len(rows_processed_this_run)}",
-        f"- Total Fixed (all time): {total_fixed}",
+        f"- Total Fixed (verified, all time): {total_verified}",
         f"- Total Blocked: {len(blocked_rows)}",
     ]
     for row in blocked_rows:
         note_suffix = f" -- {row['notes']}" if row["notes"] else ""
         summary_lines.append(f"    - {row['id']}{note_suffix}")
-    summary_lines.append(f"- Total still Not started: {total_not_started}")
-    branch_suffix = "auto-pushed Fixed rows as they completed" if auto_push else "not pushed"
+    summary_lines.append(f"- Total still unverified: {total_still_unverified}")
+    branch_suffix = "auto-pushed 'Fixed (verified)' rows as they completed" if auto_push else "not pushed"
     summary_lines.append(f"- Branch: {branch_name} ({branch_suffix})")
 
     with open(run_summary_path, "a", encoding="utf-8") as summary_file:
@@ -1754,11 +1796,11 @@ def append_final_summary_to_file(run_summary_path, final_rows, rows_processed_th
 
 def build_notification_text(rows_processed_this_run, final_rows):
     """Build a short one-line summary for the macOS notification."""
-    total_fixed = sum(1 for row in final_rows if status_is_fixed(row["fix_status"]))
+    total_verified = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_FIXED_VERIFIED))
     total_blocked = sum(1 for row in final_rows if status_matches(row["fix_status"], STATUS_BLOCKED))
     return (
         f"Processed {len(rows_processed_this_run)} row(s). "
-        f"Fixed: {total_fixed}, Blocked: {total_blocked}."
+        f"Verified: {total_verified}, Blocked: {total_blocked}."
     )
 
 
@@ -1770,7 +1812,7 @@ def send_mac_notification(message_text):
     try:
         safe_text = message_text.replace('"', "'")
         subprocess.run(
-            ["osascript", "-e", f'display notification "{safe_text}" with title "Audit Fix Runner"'],
+            ["osascript", "-e", f'display notification "{safe_text}" with title "Audit Verify Runner"'],
             capture_output=True,
         )
     except Exception:
@@ -1785,7 +1827,7 @@ def main():
     args = parse_arguments()
     pause_interval = compute_pause_interval(args.pause_every, args.max_rows)
 
-    print_banner("AUDIT FIX RUNNER -- PRE-FLIGHT", color=TermColors.BLUE)
+    print_banner("AUDIT VERIFY RUNNER -- PRE-FLIGHT", color=TermColors.BLUE)
 
     project_path = Path(args.project).expanduser().resolve()
     audit_path = validate_project_path(project_path)
@@ -1793,7 +1835,7 @@ def main():
     print_project_context(project_path)
 
     confirm_git_repo(project_path)
-    confirm_no_sibling_runner_active(project_path, "audit_fix_runner.py", ["audit_verify_runner.py"])
+    confirm_no_sibling_runner_active(project_path, "audit_verify_runner.py", ["audit_fix_runner.py"])
     confirm_clean_working_tree(project_path)
     confirm_remote_origin(project_path)
     print()
@@ -1818,7 +1860,7 @@ def main():
         sys.exit(0)
 
     if not ordered_rows:
-        print("No 'Not started' rows match your filters. Nothing to do.")
+        print("No unverified rows match your filters. Nothing to do.")
         sys.exit(0)
 
     logs_folder = ensure_logs_folder(project_path)
@@ -1845,7 +1887,7 @@ def main():
 
     should_run_loop, before_usage = run_start_usage_check(args.usage_warn_threshold, run_summary_path)
 
-    print_banner("AUDIT FIX RUNNER -- LOOP", color=TermColors.BLUE)
+    print_banner("AUDIT VERIFY RUNNER -- LOOP", color=TermColors.BLUE)
 
     test_cmd_for_prompt = args.test_cmd or "(no test command was provided -- find and run the project's existing test suite yourself)"
 
@@ -1893,7 +1935,7 @@ def main():
                 result_status = updated_row["fix_status"] or "(blank)"
                 result_note = updated_row["notes"]
 
-            if status_matches(result_status, STATUS_FIXED):
+            if status_matches(result_status, STATUS_FIXED_VERIFIED):
                 result_color = TermColors.GREEN
             elif status_matches(result_status, STATUS_BLOCKED):
                 result_color = TermColors.YELLOW
@@ -1909,24 +1951,23 @@ def main():
                     f"log) -- not by --max-turns and not by Claude Code choosing to stop. "
                     "Likely causes: the OS killed it (e.g. out of memory), the machine "
                     "slept despite caffeinate, or an external supervisor/timeout. This is "
-                    f"NOT a sign the fix was hard.{TermColors.RESET}"
+                    f"NOT a sign the verification was hard.{TermColors.RESET}"
                 )
 
-            if args.auto_push and status_matches(result_status, STATUS_FIXED):
+            if args.auto_push and status_matches(result_status, STATUS_FIXED_VERIFIED):
                 push_branch_to_origin(project_path, branch_name)
 
-            if status_matches(result_status, STATUS_NOT_STARTED):
+            if status_is_unverified(result_status):
                 if hit_turn_limit:
                     print(
                         f"This row hit the --max-turns limit ({args.max_turns}) before "
                         "finishing. It likely got stuck (e.g. waiting on a slow command) "
-                        "rather than being genuinely hard. Check the log file, and "
-                        "consider re-running this row by hand with more turns, or "
-                        "investigating why it stalled, before assuming it's simply a "
-                        "difficult finding."
+                        "rather than being genuinely hard to verify. Check the log file, "
+                        "and consider re-running this row by hand with more turns, or "
+                        "investigating why it stalled."
                     )
                 elif not likely_killed_externally:
-                    print("This row is still 'Not started' -- the session may not have finished correctly.")
+                    print("This row is still unverified -- the session may not have finished correctly.")
 
             summary_note = result_note
             if likely_killed_externally:
@@ -1976,7 +2017,7 @@ def main():
         print(f"to resume (branch '{branch_name}' will be reused).")
         exit_code = 1
 
-    print_banner("AUDIT FIX RUNNER -- POST-RUN", color=TermColors.BLUE)
+    print_banner("AUDIT VERIFY RUNNER -- POST-RUN", color=TermColors.BLUE)
 
     run_end_usage_check(run_summary_path, before_usage=before_usage)
 
