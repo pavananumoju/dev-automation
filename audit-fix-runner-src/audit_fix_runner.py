@@ -582,6 +582,39 @@ def checkout_or_create_branch(project_path, branch_name):
     print(f"On branch: {branch_name}\n")
 
 
+def restore_branch_after_dry_run(project_path, original_branch, branch_name, branch_already_existed):
+    """
+    Undoes checkout_or_create_branch's side effects after a --dry-run:
+    switches back to whatever branch was checked out before this run
+    started, and removes branch_name if this run is the one that created
+    it (a plain `git branch -d`, safe since a dry run never commits, so
+    the branch can only be identical to its base -- trivially "merged").
+    A dry run should leave git state exactly as it found it.
+    """
+    if original_branch != branch_name:
+        succeeded, _stdout_text, stderr_text = run_git_command(
+            project_path, ["checkout", original_branch]
+        )
+        if not succeeded:
+            print(
+                f"WARNING: could not switch back to '{original_branch}' after the dry "
+                f"run:\n{stderr_text}\nYou may need to `git checkout {original_branch}` "
+                "yourself."
+            )
+            return
+
+    if not branch_already_existed:
+        succeeded, _stdout_text, stderr_text = run_git_command(
+            project_path, ["branch", "-d", branch_name]
+        )
+        if not succeeded:
+            print(
+                f"WARNING: could not remove the '{branch_name}' branch created for this "
+                f"dry run:\n{stderr_text}\nYou may want to remove it yourself with "
+                f"`git branch -d {branch_name}`."
+            )
+
+
 # ======================================================================
 # PRE-FLIGHT: reading AUDIT.md's Master Tracking Table (read-only)
 # ======================================================================
@@ -1799,6 +1832,8 @@ def main():
     print()
 
     branch_name = args.branch or f"audit-{datetime.now().strftime('%Y-%m-%d')}"
+    original_branch = get_current_branch(project_path)
+    branch_already_existed = branch_exists_locally(project_path, branch_name)
     checkout_or_create_branch(project_path, branch_name)
 
     rows = parse_master_tracking_table(audit_path)
@@ -1815,6 +1850,7 @@ def main():
 
     if args.dry_run:
         print_dry_run_plan(branch_name, ordered_rows)
+        restore_branch_after_dry_run(project_path, original_branch, branch_name, branch_already_existed)
         sys.exit(0)
 
     if not ordered_rows:
