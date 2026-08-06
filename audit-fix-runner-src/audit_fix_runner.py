@@ -31,10 +31,13 @@ Run with --help to see every available option.
 """
 
 import argparse
+import atexit
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -94,13 +97,67 @@ If a design-system or 'Approved Values' section exists in AUDIT.md and
 this finding relates to it (colors, spacing, motion, typography, etc.),
 use only those values. Do not invent new ones.
 
+After the unit suite passes, decide whether {row_id}'s finding has any
+on-screen or interactive effect (a color, a layout, an animation, a
+tap/gesture outcome, text a user would see) as opposed to a purely
+internal change (calculation, storage, threading, timing with no visible
+surface).
+
+If it's purely internal: skip on-device verification and say so in one
+clause in the Notes -- don't spend time on an emulator test that can't
+observe anything the unit suite doesn't already cover.
+
+If it does have an observable effect, verify it for real on-device
+before deciding Fixed or Blocked:
+
+1. Run `adb devices -l`. If it lists anything other than exactly one
+   emulator (e.g. a real device is attached), skip on-device
+   verification, note in AUDIT.md that it was skipped because a real
+   device was present, and fall back to the unit-test-only result.
+   Never run instrumented tests when a real device is connected.
+
+2. If no emulator is listed, boot one:
+   ~/Library/Android/sdk/emulator/emulator -avd Pixel_3a_API_34_extension_level_7_arm64-v8a -no-snapshot &
+   Then poll `adb shell getprop sys.boot_completed` every few seconds
+   (up to ~2 minutes) until it returns 1.
+
+3. Write or extend a Compose UI test under app/src/androidTest/...,
+   matching the pattern in
+   app/src/androidTest/java/com/capitalrecall/app/ui/components/CompletionOverlayTest.kt:
+   - Host the affected composable directly via composeRule.setContent(...)
+     where possible, rather than the full app/ViewModel/navigation
+     graph -- only go through the real screen if the fix can't be
+     observed any other way.
+   - For a color/visual fix: capture the node with
+     captureToImage().asAndroidBitmap().getPixel(x, y) and assert
+     against the expected value with a small tolerance. Sample a point
+     well inside any padding() on that node, not near its edge -- a
+     node's captured bounds include its own padding, not just its
+     visible painted area; dump a debug screenshot to a file and pull
+     it via adb if you're not sure where the paint boundary actually is
+     before picking coordinates.
+   - For an interaction fix: drive the real click/gesture and assert
+     the resulting state or callback fired, not just that nothing
+     crashed.
+
+4. Run only that test class:
+   ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=<fully.qualified.TestClassName>
+
+5. A failure here is treated exactly like a unit test failure: fix the
+   underlying issue (never the test) or mark the row Blocked with why.
+   Do not leave a failing on-device test uncommitted-but-unmentioned.
+
 Never weaken or delete an existing test's assertion just to make it pass.
 If a test looks wrong, say so in your notes instead of editing it away.
 
 If everything passes: commit with a message referencing {row_id}, and
 update AUDIT.md's Master Tracking Table row for {row_id} yourself -- set
 Fix Status to 'Fixed', add the commit hash, and add one plain-language
-sentence in Notes about what changed. Do not push.
+sentence in Notes about what changed. Say explicitly how it was
+verified: name the on-device test class and what it checked if you ran
+one, or say the verification was unit-test-only (and why: purely
+internal change, or a real device was attached) if you did not. Do not
+push.
 
 If it does not pass: do not commit. Update the same row instead -- set Fix
 Status to 'Blocked' and add a one-line reason in Notes.
@@ -199,6 +256,24 @@ def parse_arguments():
             '"./gradlew testDebugUnitTest" or "npm test". Passed to each '
             "row's Claude session as the required verification step. If "
             "omitted, you will be asked to confirm before continuing."
+        ),
+    )
+    parser.add_argument(
+        "--emulator-avd",
+        dest="emulator_avd",
+        default=None,
+        help=(
+            "Name of an Android emulator AVD (e.g. "
+            '"Pixel_3a_API_34_extension_level_7_arm64-v8a") to make '
+            "available for on-device verification steps. If no device or "
+            "emulator is already attached when the run starts, this AVD "
+            "is booted once, before the first row, and left running for "
+            "every row in the run (not rebooted per row) -- if this "
+            "script is the one that started it, it's shut down again "
+            "after the last row. If a device or emulator is already "
+            "attached, it's reused as-is and left running afterward, "
+            "since this script didn't start it. Omit for non-Android "
+            "projects, or to manage the emulator yourself."
         ),
     )
     parser.add_argument(
@@ -311,7 +386,7 @@ def run_git_command(project_path, git_args):
         print("ERROR: git was not found on your PATH. Please install git and try again.")
         sys.exit(1)
 
-    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+    return result.returncode == 0, result.stdout.rstrip("\n"), result.stderr.strip()
 
 
 def confirm_git_repo(project_path):
@@ -1277,6 +1352,156 @@ def stop_caffeinate_for_row(caffeinate_process):
         caffeinate_process.wait()
 
 
+# ======================================================================
+# ANDROID EMULATOR LIFECYCLE (for --emulator-avd)
+# ======================================================================
+#
+# Booted once for the whole run (not once per row -- a cold boot is ~60-90s)
+# only if nothing is already attached, and only shut down again afterward if
+# this script is the one that started it. An emulator/device that was
+# already running before the run started is left exactly as it was found.
+
+def find_android_sdk_tool(tool_relative_path):
+    """
+    Locate an Android SDK command-line tool (e.g. "platform-tools/adb" or
+    "emulator/emulator"). Checks $ANDROID_HOME / $ANDROID_SDK_ROOT first,
+    then the common macOS default install location, then falls back to the
+    bare tool name and lets the shell's PATH resolve it.
+    """
+    for env_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk_root = os.environ.get(env_var)
+        if sdk_root:
+            candidate = Path(sdk_root).expanduser() / tool_relative_path
+            if candidate.exists():
+                return str(candidate)
+
+    default_candidate = Path.home() / "Library" / "Android" / "sdk" / tool_relative_path
+    if default_candidate.exists():
+        return str(default_candidate)
+
+    return Path(tool_relative_path).name
+
+
+def list_attached_android_devices(adb_binary):
+    """
+    Returns the serials of every device/emulator currently visible to adb
+    and ready to use (adb reports them with state "device"; "offline" and
+    "unauthorized" entries are excluded since they can't run tests yet).
+    """
+    try:
+        result = subprocess.run(
+            [adb_binary, "devices"], capture_output=True, text=True, timeout=15
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    serials = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "device":
+            serials.append(parts[0])
+    return serials
+
+
+def wait_for_emulator_boot(adb_binary, serial, timeout_seconds=180):
+    """
+    Polls `adb -s <serial> shell getprop sys.boot_completed` every 3
+    seconds until it returns "1" or timeout_seconds elapses. Returns True
+    if boot completed in time, False otherwise.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [adb_binary, "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.stdout.strip() == "1":
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(3)
+    return False
+
+
+def ensure_emulator_running(avd_name, adb_binary, emulator_binary):
+    """
+    Makes sure exactly one Android device/emulator is available for
+    on-device verification steps, starting one only if nothing is already
+    attached.
+
+    Returns {"started_by_us": bool, "serial": str or None}. If a
+    device/emulator was already attached, it's reused untouched and
+    started_by_us is False -- this run must never close something it
+    didn't open. Otherwise avd_name is booted, the boot wait is
+    caffeinated (a ~60-90s cold boot is long enough for the Mac to try to
+    sleep), and started_by_us is True.
+    """
+    existing = list_attached_android_devices(adb_binary)
+    if existing:
+        print(
+            f"Android device/emulator already attached ({', '.join(existing)}) -- "
+            "reusing it, and leaving it running when this run ends."
+        )
+        return {"started_by_us": False, "serial": existing[0]}
+
+    print(f"No Android device/emulator attached. Booting '{avd_name}' for on-device verification...")
+    caffeinate_process = start_caffeinate_for_row()
+    try:
+        subprocess.Popen(
+            [emulator_binary, "-avd", avd_name, "-no-snapshot"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # The serial usually shows up in `adb devices` well before
+        # sys.boot_completed=1, so wait for that first.
+        serial = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and serial is None:
+            attached = list_attached_android_devices(adb_binary)
+            if attached:
+                serial = attached[0]
+            else:
+                time.sleep(3)
+
+        if serial is None:
+            print(
+                "WARNING: the emulator did not appear in `adb devices` within 60s. "
+                "On-device verification steps this run may not work."
+            )
+            return {"started_by_us": False, "serial": None}
+
+        if wait_for_emulator_boot(adb_binary, serial):
+            print(f"Emulator '{avd_name}' booted ({serial}).")
+        else:
+            print(
+                f"WARNING: emulator '{avd_name}' ({serial}) did not finish booting "
+                "within the timeout. Leaving it running, but on-device verification "
+                "steps this run may not work."
+            )
+        return {"started_by_us": True, "serial": serial}
+    finally:
+        stop_caffeinate_for_row(caffeinate_process)
+
+
+def shutdown_emulator(adb_binary, serial):
+    """
+    Cleanly shuts down the emulator this run started, via
+    `adb -s <serial> emu kill`. Only ever called with a serial this script
+    booted itself -- never for a device/emulator it found already running.
+    """
+    if serial is None:
+        return
+    print(f"Shutting down emulator ({serial}) started for this run...")
+    try:
+        subprocess.run([adb_binary, "-s", serial, "emu", "kill"], timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("Could not confirm the emulator shut down cleanly -- you may need to close it manually.")
+
+
 def run_claude_session(prompt, project_path, log_path, max_turns):
     """
     Run `claude -p <prompt> --permission-mode acceptEdits --verbose
@@ -1562,6 +1787,23 @@ def main():
     start_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_summary_path = logs_folder / f"run_summary_{start_timestamp}.md"
     initialize_run_summary_file(run_summary_path, project_path, branch_name, args)
+
+    # Boot the emulator once, before the first row, so on-device
+    # verification steps never each pay their own ~60-90s cold-boot cost --
+    # and so nothing this run needs to babysit whether it's already open.
+    adb_binary = None
+    emulator_state = {"started_by_us": False, "serial": None}
+    if args.emulator_avd:
+        adb_binary = find_android_sdk_tool("platform-tools/adb")
+        emulator_binary = find_android_sdk_tool("emulator/emulator")
+        emulator_state = ensure_emulator_running(args.emulator_avd, adb_binary, emulator_binary)
+        if emulator_state["started_by_us"]:
+            # atexit (not a try/finally around the row loop below) so this
+            # still fires on KeyboardInterrupt, ClaudeNotFoundError, an
+            # early sys.exit(), or any other uncaught exception -- an
+            # emulator this run started must never be left orphaned no
+            # matter how the run ends.
+            atexit.register(shutdown_emulator, adb_binary, emulator_state["serial"])
 
     should_run_loop, before_usage = run_start_usage_check(args.usage_warn_threshold, run_summary_path)
 
