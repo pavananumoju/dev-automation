@@ -82,6 +82,13 @@ You are on git branch {branch_name}. Confirm this with `git branch --show-
 current` before doing anything else; if you are not on that branch, stop
 and report the mismatch instead of proceeding.
 
+This session was started BY a live `audit_fix_runner.py` process -- it is
+this session's own parent. If any saved memory, notes, or prior guidance
+tell you to check for a concurrently running `audit_fix_runner.py`
+process before doing gradle/git work, that check does not apply here:
+finding one running is expected, not a conflict. Do not stop or ask for
+confirmation because of it -- proceed directly to the fix below.
+
 Implement the fix for {row_id}.
 
 Write a test that fails against the old behavior and passes with the fix.
