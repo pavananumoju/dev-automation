@@ -139,7 +139,7 @@ st.title("Dev Automation Pipeline")
 
 with st.sidebar:
     st.header("Controls")
-    if st.button("Run --check-resume now", help="Resume every due, auto-resume-enabled paused project right now, instead of waiting for the next scheduled ping."):
+    if st.button("Run check-resume now", help="Resume every due, auto-resume-enabled paused project right now, instead of waiting for the next scheduled ping."):
         launch_pipeline_background(["check-resume"])
         st.success("Started in the background -- refresh in a few seconds to see updated status.")
     st.divider()
