@@ -94,7 +94,7 @@ class PausedForQuotaError(Exception):
 FALLBACK_RESUME_DELAY_HOURS = 6
 
 
-def check_hard_pause(engine, project_path, stage_label, run_args, auto_resume, hard_pause_threshold, db_path=None):
+def check_hard_pause(engine, project_path, stage_label, run_args, auto_resume, hard_pause_threshold, action=None, db_path=None):
     """
     Check usage against hard_pause_threshold at a stage/phase boundary
     (never mid-session -- see the module docstring's note on why this is
@@ -141,7 +141,7 @@ def check_hard_pause(engine, project_path, stage_label, run_args, auto_resume, h
         else f"week {usage.week_percent}% used"
     )
     ss.mark_paused_quota(
-        project_path, stage_label, reason, resume_at_dt, run_args=run_args, auto_resume=auto_resume, db_path=db_path
+        project_path, stage_label, reason, resume_at_dt, action=action, run_args=run_args, auto_resume=auto_resume, db_path=db_path
     )
     print(f"\n{TermColors.YELLOW}Usage at or above --hard-pause-threshold ({hard_pause_threshold}%): {reason}.{TermColors.RESET}")
     print(f"Pausing before {stage_label}. Recorded in state_store, resume time: {resume_at_dt}.")
@@ -594,7 +594,7 @@ def run_stage0(project_path, logs_folder, max_turns, auto_push, branch_name, pau
         print("Stage 0 (Project Scan): already done -- skipping.")
         return
 
-    check_hard_pause(pause_ctx["engine"], project_path, "Stage 0 (Project Scan)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
+    check_hard_pause(pause_ctx["engine"], project_path, "Stage 0 (Project Scan)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], action=pause_ctx["action"], db_path=pause_ctx["db_path"])
 
     print_banner("STAGE 0: PROJECT SCAN")
     (project_path / "audit-gen").mkdir(exist_ok=True)
@@ -620,7 +620,7 @@ def run_stage1(project_path, logs_folder, max_turns, auto_push, branch_name, pau
         print("Stage 1 (Competitive Research): already done -- skipping.")
         return
 
-    check_hard_pause(pause_ctx["engine"], project_path, "Stage 1 (Research)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
+    check_hard_pause(pause_ctx["engine"], project_path, "Stage 1 (Research)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], action=pause_ctx["action"], db_path=pause_ctx["db_path"])
 
     print_banner("STAGE 1: COMPETITIVE & UX RESEARCH")
     log_path = build_stage_log_path(logs_folder, "stage1_research")
@@ -644,7 +644,7 @@ def run_stage2(project_path, logs_folder, max_turns, auto_push, branch_name, rev
     if already_existed:
         print("Stage 2 (Audit Prompt Build): already done -- skipping.")
     else:
-        check_hard_pause(pause_ctx["engine"], project_path, "Stage 2 (Audit Prompt Build)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
+        check_hard_pause(pause_ctx["engine"], project_path, "Stage 2 (Audit Prompt Build)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], action=pause_ctx["action"], db_path=pause_ctx["db_path"])
 
         print_banner("STAGE 2: AUDIT PROMPT BUILD")
         log_path = build_stage_log_path(logs_folder, "stage2_prompt_build")
@@ -692,7 +692,7 @@ def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, rev
         # Checked once per phase, not mid-phase -- see check_hard_pause()'s
         # docstring for why a phase boundary is the granularity this can
         # actually guarantee.
-        check_hard_pause(pause_ctx["engine"], project_path, phase_label, pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
+        check_hard_pause(pause_ctx["engine"], project_path, phase_label, pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], action=pause_ctx["action"], db_path=pause_ctx["db_path"])
 
         print_banner(f"STAGE 3 -- {phase_label}")
         staging_relative_path = staging_path.relative_to(project_path).as_posix()
@@ -822,9 +822,10 @@ def run_generator(project_path, branch, max_turns, review_required, auto_push, u
         "run_args": run_args,
         "auto_resume": auto_resume,
         "hard_pause_threshold": hard_pause_threshold,
+        "action": "generate",
         "db_path": None,  # None -> state_store's own default DB path
     }
-    ss.mark_running(project_path, "stage0", run_args=run_args, auto_resume=auto_resume)
+    ss.mark_running(project_path, "stage0", action="generate", run_args=run_args, auto_resume=auto_resume)
 
     try:
         run_stage0(project_path, logs_folder, max_turns, auto_push, branch, pause_ctx)
@@ -832,10 +833,10 @@ def run_generator(project_path, branch, max_turns, review_required, auto_push, u
         run_stage2(project_path, logs_folder, max_turns, auto_push, branch, review_required, pause_ctx)
         run_stage3(project_path, logs_folder, max_turns, auto_push, branch, review_required, pause_ctx)
     except (GeneratorError, er.UnknownEngineError) as exc:
-        ss.mark_failed(project_path, "unknown", str(exc), run_args=run_args)
+        ss.mark_failed(project_path, "unknown", str(exc), action="generate", run_args=run_args)
         raise
 
-    ss.mark_completed(project_path, stage="stage3")
+    ss.mark_completed(project_path, stage="stage3", action="generate")
 
     print_banner("AUDIT GENERATOR -- DONE", color=TermColors.GREEN)
     print(f"AUDIT.md is ready at: {audit_path}")
