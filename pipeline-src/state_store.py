@@ -124,6 +124,7 @@ def _connect(db_path=None):
         CREATE TABLE IF NOT EXISTS runs (
             project_path   TEXT PRIMARY KEY,
             status         TEXT NOT NULL,
+            action         TEXT,
             current_stage  TEXT,
             paused_reason  TEXT,
             resume_at      TEXT,
@@ -134,6 +135,16 @@ def _connect(db_path=None):
         )
         """
     )
+    try:
+        # Lets an existing DB file created before the `action` column
+        # existed pick it up in place, rather than needing to be deleted.
+        # Harmless no-op (duplicate-column error, swallowed) on a DB that
+        # already has it, including one freshly created by the statement
+        # just above.
+        connection.execute("ALTER TABLE runs ADD COLUMN action TEXT")
+        connection.commit()
+    except sqlite3.OperationalError:
+        pass
     connection.commit()
     return connection
 
@@ -178,12 +189,21 @@ def _upsert(project_path, db_path=None, **fields):
         connection.commit()
 
 
-def mark_running(project_path, stage, run_args=None, auto_resume=False, db_path=None):
-    """Record that project_path's pipeline is actively running stage. Clears any prior pause/error state."""
+def mark_running(project_path, stage, action=None, run_args=None, auto_resume=False, db_path=None):
+    """
+    Record that project_path is actively running stage. Clears any prior
+    pause/error state. action is one of "generate", "fix", "verify" --
+    generate/fix/verify are independent, separately-triggered operations
+    (see pipeline.py's module docstring), so this is what tells
+    due_paused_projects()/check_resume() which one to actually resume,
+    since current_stage alone (a free-text label) isn't reliably
+    machine-dispatchable on its own.
+    """
     _upsert(
         project_path,
         db_path=db_path,
         status=STATUS_RUNNING,
+        action=action,
         current_stage=stage,
         paused_reason=None,
         resume_at=None,
@@ -193,12 +213,13 @@ def mark_running(project_path, stage, run_args=None, auto_resume=False, db_path=
     )
 
 
-def mark_paused_quota(project_path, stage, reason, resume_at_dt, run_args=None, auto_resume=False, db_path=None):
+def mark_paused_quota(project_path, stage, reason, resume_at_dt, action=None, run_args=None, auto_resume=False, db_path=None):
     """Record a usage-limit pause, with the absolute time it's safe to resume."""
     _upsert(
         project_path,
         db_path=db_path,
         status=STATUS_PAUSED_QUOTA,
+        action=action,
         current_stage=stage,
         paused_reason=reason,
         resume_at=to_utc_iso(resume_at_dt) if resume_at_dt else None,
@@ -208,12 +229,13 @@ def mark_paused_quota(project_path, stage, reason, resume_at_dt, run_args=None, 
     )
 
 
-def mark_paused_review(project_path, stage, reason, run_args=None, db_path=None):
+def mark_paused_review(project_path, stage, reason, action=None, run_args=None, db_path=None):
     """Record a --review-required pause. Never auto-resumed -- only a human re-running the tool clears this."""
     _upsert(
         project_path,
         db_path=db_path,
         status=STATUS_PAUSED_REVIEW,
+        action=action,
         current_stage=stage,
         paused_reason=reason,
         resume_at=None,
@@ -223,11 +245,12 @@ def mark_paused_review(project_path, stage, reason, run_args=None, db_path=None)
     )
 
 
-def mark_completed(project_path, stage=None, db_path=None):
+def mark_completed(project_path, stage=None, action=None, db_path=None):
     _upsert(
         project_path,
         db_path=db_path,
         status=STATUS_COMPLETED,
+        action=action,
         current_stage=stage,
         paused_reason=None,
         resume_at=None,
@@ -237,11 +260,12 @@ def mark_completed(project_path, stage=None, db_path=None):
     )
 
 
-def mark_failed(project_path, stage, reason, run_args=None, db_path=None):
+def mark_failed(project_path, stage, reason, action=None, run_args=None, db_path=None):
     _upsert(
         project_path,
         db_path=db_path,
         status=STATUS_FAILED,
+        action=action,
         current_stage=stage,
         paused_reason=None,
         resume_at=None,
