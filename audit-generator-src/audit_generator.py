@@ -45,6 +45,15 @@ from pathlib import Path
 import audit_compiler
 import engine_registry as er
 
+# state_store.py lives in the sibling pipeline-src/ folder, not this one --
+# it's deliberately dependency-free of audit_generator.py/engine_registry.py
+# so it can be tested and reasoned about on its own (see its own docstring).
+# This is the one place that direction is crossed, since Stage 3's per-phase
+# boundaries are the natural, safe granularity for a usage-limit pause, and
+# only this script's stage loop actually knows where those boundaries are.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline-src"))
+import state_store as ss
+
 
 # ======================================================================
 # CONSTANTS
@@ -71,6 +80,76 @@ def print_banner(title, color=TermColors.CYAN):
 
 class GeneratorError(Exception):
     """Raised for any condition that should stop the run with a clear message."""
+
+
+class PausedForQuotaError(Exception):
+    """
+    Raised (and caught in main(), handled distinctly from GeneratorError --
+    this is an expected, graceful stop, not a failure) when usage crosses
+    --hard-pause-threshold at a stage/phase boundary. The run's state is
+    already recorded in state_store by the time this is raised.
+    """
+
+
+FALLBACK_RESUME_DELAY_HOURS = 6
+
+
+def check_hard_pause(engine, project_path, stage_label, run_args, auto_resume, hard_pause_threshold, db_path=None):
+    """
+    Check usage against hard_pause_threshold at a stage/phase boundary
+    (never mid-session -- see the module docstring's note on why this is
+    the granularity actually checked). If either session or week usage is
+    at or above the threshold, record PAUSED_QUOTA in state_store (with
+    auto_resume as given -- False still records the pause for visibility,
+    it just means state_store.due_paused_projects() will never pick it up
+    automatically) and raise PausedForQuotaError.
+
+    resume_at is parsed from whichever of session_reset/week_reset
+    actually crossed the threshold (the later of the two, if both did,
+    since both must clear). If neither reset string parses, falls back to
+    now + FALLBACK_RESUME_DELAY_HOURS rather than pausing forever with no
+    resume time at all -- logged clearly so it's not mistaken for a real
+    reset time.
+    """
+    usage = engine.check_usage()
+    session_over = (usage.session_percent or 0) >= hard_pause_threshold
+    week_over = (usage.week_percent or 0) >= hard_pause_threshold
+    if not session_over and not week_over:
+        return
+
+    candidates = []
+    if session_over:
+        candidates.append(ss.parse_reset_timestamp(usage.session_reset))
+    if week_over:
+        candidates.append(ss.parse_reset_timestamp(usage.week_reset))
+    candidates = [c for c in candidates if c is not None]
+
+    if candidates:
+        resume_at_dt = max(candidates)
+    else:
+        from datetime import timedelta, timezone
+
+        resume_at_dt = datetime.now(timezone.utc) + timedelta(hours=FALLBACK_RESUME_DELAY_HOURS)
+        print(
+            f"(Could not parse a reset time from usage output -- falling back to a "
+            f"{FALLBACK_RESUME_DELAY_HOURS}-hour retry delay.)"
+        )
+
+    reason = (
+        f"session {usage.session_percent}% used"
+        if session_over
+        else f"week {usage.week_percent}% used"
+    )
+    ss.mark_paused_quota(
+        project_path, stage_label, reason, resume_at_dt, run_args=run_args, auto_resume=auto_resume, db_path=db_path
+    )
+    print(f"\n{TermColors.YELLOW}Usage at or above --hard-pause-threshold ({hard_pause_threshold}%): {reason}.{TermColors.RESET}")
+    print(f"Pausing before {stage_label}. Recorded in state_store, resume time: {resume_at_dt}.")
+    if auto_resume:
+        print("--auto-resume is on: this will resume automatically once a scheduled check finds it's due.")
+    else:
+        print("--auto-resume is off: re-run this same command yourself once usage has reset.")
+    raise PausedForQuotaError(reason)
 
 
 # ======================================================================
@@ -130,6 +209,30 @@ def parse_arguments():
         dest="dry_run",
         action="store_true",
         help="Print which stages/phases are already done vs. still pending, and exit without running anything.",
+    )
+    parser.add_argument(
+        "--hard-pause-threshold",
+        dest="hard_pause_threshold",
+        type=int,
+        default=97,
+        help=(
+            "If session or week usage is at or above N percent at a stage/phase boundary, "
+            "pause automatically (recorded in pipeline-src/pipeline_state.db) instead of "
+            "starting that stage/phase. Default: 97. Distinct from --usage-warn-threshold, "
+            "which only asks for confirmation once, before the run starts."
+        ),
+    )
+    parser.add_argument(
+        "--auto-resume",
+        dest="auto_resume",
+        action="store_true",
+        help=(
+            "If a --hard-pause-threshold pause happens, mark it for automatic resume once "
+            "usage resets -- pipeline.py --check-resume (meant to be pinged periodically by "
+            "cron/launchd) will then pick it back up on its own. Off by default: a pause is "
+            "still recorded either way, but without this, only re-running this same command "
+            "yourself resumes it."
+        ),
     )
     return parser.parse_args()
 
@@ -484,12 +587,14 @@ def build_stage_log_path(logs_folder, stage_label):
     return logs_folder / f"{timestamp}_{safe_label}.log"
 
 
-def run_stage0(project_path, logs_folder, max_turns, auto_push, branch_name):
+def run_stage0(project_path, logs_folder, max_turns, auto_push, branch_name, pause_ctx):
     profile_path = project_path / "audit-gen" / "PROJECT_PROFILE.md"
     manifest_path = project_path / "audit-gen" / "CONTEXT_MANIFEST.md"
     if profile_path.exists() and manifest_path.exists():
         print("Stage 0 (Project Scan): already done -- skipping.")
         return
+
+    check_hard_pause(pause_ctx["engine"], project_path, "Stage 0 (Project Scan)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
 
     print_banner("STAGE 0: PROJECT SCAN")
     (project_path / "audit-gen").mkdir(exist_ok=True)
@@ -509,11 +614,13 @@ def run_stage0(project_path, logs_folder, max_turns, auto_push, branch_name):
             push_branch_to_origin(project_path, branch_name)
 
 
-def run_stage1(project_path, logs_folder, max_turns, auto_push, branch_name):
+def run_stage1(project_path, logs_folder, max_turns, auto_push, branch_name, pause_ctx):
     notes_path = project_path / "audit-gen" / "RESEARCH_NOTES.md"
     if notes_path.exists():
         print("Stage 1 (Competitive Research): already done -- skipping.")
         return
+
+    check_hard_pause(pause_ctx["engine"], project_path, "Stage 1 (Research)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
 
     print_banner("STAGE 1: COMPETITIVE & UX RESEARCH")
     log_path = build_stage_log_path(logs_folder, "stage1_research")
@@ -531,12 +638,14 @@ def run_stage1(project_path, logs_folder, max_turns, auto_push, branch_name):
             push_branch_to_origin(project_path, branch_name)
 
 
-def run_stage2(project_path, logs_folder, max_turns, auto_push, branch_name, review_required):
+def run_stage2(project_path, logs_folder, max_turns, auto_push, branch_name, review_required, pause_ctx):
     prompt_path = project_path / "audit-gen" / "AUDIT_PROMPT.md"
     already_existed = prompt_path.exists()
     if already_existed:
         print("Stage 2 (Audit Prompt Build): already done -- skipping.")
     else:
+        check_hard_pause(pause_ctx["engine"], project_path, "Stage 2 (Audit Prompt Build)", pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
+
         print_banner("STAGE 2: AUDIT PROMPT BUILD")
         log_path = build_stage_log_path(logs_folder, "stage2_prompt_build")
         run_stage_session("claude", STAGE2_PROMPT_TEMPLATE, project_path, log_path, max_turns, "Stage 2 (Audit Prompt Build)")
@@ -566,7 +675,7 @@ def run_stage2(project_path, logs_folder, max_turns, auto_push, branch_name, rev
             )
 
 
-def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, review_required):
+def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, review_required, pause_ctx):
     print_banner("STAGE 3: PHASED AUDIT EXECUTION")
     prompt_path = project_path / "audit-gen" / "AUDIT_PROMPT.md"
     phases = parse_audit_prompt_phases(prompt_path.read_text(encoding="utf-8"))
@@ -579,6 +688,11 @@ def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, rev
         if staging_path.exists():
             print(f"{phase_label}: already staged -- skipping.")
             continue
+
+        # Checked once per phase, not mid-phase -- see check_hard_pause()'s
+        # docstring for why a phase boundary is the granularity this can
+        # actually guarantee.
+        check_hard_pause(pause_ctx["engine"], project_path, phase_label, pause_ctx["run_args"], pause_ctx["auto_resume"], pause_ctx["hard_pause_threshold"], db_path=pause_ctx["db_path"])
 
         print_banner(f"STAGE 3 -- {phase_label}")
         staging_relative_path = staging_path.relative_to(project_path).as_posix()
@@ -663,6 +777,77 @@ def print_dry_run_plan(project_path):
 # MAIN
 # ======================================================================
 
+def run_generator(project_path, branch, max_turns, review_required, auto_push, usage_warn_threshold, hard_pause_threshold, auto_resume):
+    """
+    The full Stage 0-3 run, as a plain function -- what main() drives from
+    the CLI, and what pipeline.py's --check-resume calls directly (in the
+    same process, with the run_args state_store already has on file for a
+    paused project) to resume, without shelling back out to a new
+    `python3 audit_generator.py ...` subprocess or duplicating this flow.
+
+    Returns the Path to AUDIT.md on success. Raises PausedForQuotaError,
+    GeneratorError, or engine_registry.UnknownEngineError -- callers
+    decide how to present those (main() turns them into exit codes and
+    console messages; pipeline.py's resume loop just needs to know a
+    given project didn't finish so it can move on to the next one).
+    """
+    project_path = Path(project_path)
+    audit_path = project_path / "AUDIT.md"
+    if audit_path.exists():
+        raise GeneratorError(
+            f"{audit_path} already exists -- this project already has an audit. Run "
+            "audit_fix_runner.py / audit_verify_runner.py to work through it, or move AUDIT.md "
+            "aside yourself first if you genuinely want to regenerate from scratch."
+        )
+
+    confirm_git_repo(project_path)
+    checkout_or_create_branch(project_path, branch)
+
+    engine = er.get_engine("claude")
+    check_and_report_usage(engine, "BEFORE THIS RUN", warn_threshold=usage_warn_threshold)
+
+    logs_folder = ensure_logs_folder(project_path)
+
+    run_args = {
+        "branch": branch,
+        "max_turns": max_turns,
+        "review_required": review_required,
+        "auto_push": auto_push,
+        "usage_warn_threshold": usage_warn_threshold,
+        "hard_pause_threshold": hard_pause_threshold,
+        "auto_resume": auto_resume,
+    }
+    pause_ctx = {
+        "engine": engine,
+        "run_args": run_args,
+        "auto_resume": auto_resume,
+        "hard_pause_threshold": hard_pause_threshold,
+        "db_path": None,  # None -> state_store's own default DB path
+    }
+    ss.mark_running(project_path, "stage0", run_args=run_args, auto_resume=auto_resume)
+
+    try:
+        run_stage0(project_path, logs_folder, max_turns, auto_push, branch, pause_ctx)
+        run_stage1(project_path, logs_folder, max_turns, auto_push, branch, pause_ctx)
+        run_stage2(project_path, logs_folder, max_turns, auto_push, branch, review_required, pause_ctx)
+        run_stage3(project_path, logs_folder, max_turns, auto_push, branch, review_required, pause_ctx)
+    except (GeneratorError, er.UnknownEngineError) as exc:
+        ss.mark_failed(project_path, "unknown", str(exc), run_args=run_args)
+        raise
+
+    ss.mark_completed(project_path, stage="stage3")
+
+    print_banner("AUDIT GENERATOR -- DONE", color=TermColors.GREEN)
+    print(f"AUDIT.md is ready at: {audit_path}")
+    print(f"Everything was committed on branch: {branch}")
+    print(
+        "\nNext step -- run the fixer on this SAME branch, e.g.:\n"
+        f"  python3 audit_fix_runner.py --project {project_path} --branch {branch} --test-cmd \"...\""
+    )
+    check_and_report_usage(engine, "AFTER THIS RUN")
+    return audit_path
+
+
 def main():
     args = parse_arguments()
     print_banner("AUDIT GENERATOR -- PRE-FLIGHT", color=TermColors.BLUE)
@@ -672,44 +857,28 @@ def main():
         print(f"ERROR: --project path does not exist or is not a folder: {project_path}")
         sys.exit(1)
 
-    audit_path = project_path / "AUDIT.md"
-    if audit_path.exists():
-        print(f"ERROR: {audit_path} already exists -- this project already has an audit.")
-        print("Run audit_fix_runner.py / audit_verify_runner.py to work through it, or move")
-        print("AUDIT.md aside yourself first if you genuinely want to regenerate from scratch.")
-        sys.exit(1)
+    branch_name = args.branch or f"audit-gen-{datetime.now().strftime('%Y-%m-%d')}"
+
+    if args.dry_run:
+        print_dry_run_plan(project_path)
+        sys.exit(0)
 
     try:
-        confirm_git_repo(project_path)
-
-        branch_name = args.branch or f"audit-gen-{datetime.now().strftime('%Y-%m-%d')}"
-
-        if args.dry_run:
-            print_dry_run_plan(project_path)
-            sys.exit(0)
-
-        checkout_or_create_branch(project_path, branch_name)
-
-        engine = er.get_engine("claude")
-        check_and_report_usage(engine, "BEFORE THIS RUN", warn_threshold=args.usage_warn_threshold)
-
-        logs_folder = ensure_logs_folder(project_path)
-
-        run_stage0(project_path, logs_folder, args.max_turns, args.auto_push, branch_name)
-        run_stage1(project_path, logs_folder, args.max_turns, args.auto_push, branch_name)
-        run_stage2(project_path, logs_folder, args.max_turns, args.auto_push, branch_name, args.review_required)
-        run_stage3(project_path, logs_folder, args.max_turns, args.auto_push, branch_name, args.review_required)
-
-        print_banner("AUDIT GENERATOR -- DONE", color=TermColors.GREEN)
-        print(f"AUDIT.md is ready at: {audit_path}")
-        print(f"Everything was committed on branch: {branch_name}")
-        print(
-            "\nNext step -- run the fixer on this SAME branch, e.g.:\n"
-            f"  python3 audit_fix_runner.py --project {project_path} --branch {branch_name} --test-cmd \"...\""
+        run_generator(
+            project_path,
+            branch_name,
+            args.max_turns,
+            args.review_required,
+            args.auto_push,
+            args.usage_warn_threshold,
+            args.hard_pause_threshold,
+            args.auto_resume,
         )
-
-        check_and_report_usage(engine, "AFTER THIS RUN")
-
+    except PausedForQuotaError:
+        # Already fully reported and recorded by check_hard_pause() -- this
+        # is an expected, graceful stop, not a failure, so no ERROR banner
+        # and no non-zero exit code.
+        sys.exit(0)
     except GeneratorError as exc:
         print(f"\n{TermColors.RED}ERROR: {exc}{TermColors.RESET}")
         sys.exit(1)
