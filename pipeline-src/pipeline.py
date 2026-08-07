@@ -105,6 +105,9 @@ def parse_arguments():
 
     subparsers.add_parser("check-resume", help="Resume every due, auto-resume-enabled paused generate/fix/verify run.")
 
+    resume_project_parser = subparsers.add_parser("resume-project", help="Resume ONE specific paused project right now, regardless of due time or --auto-resume.")
+    resume_project_parser.add_argument("--project", required=True)
+
     return parser.parse_args()
 
 
@@ -279,6 +282,32 @@ ACTION_RUNNERS = {
 }
 
 
+def _resume_one(state):
+    """Shared by check_resume() and resume_project(): dispatch one paused row's stored action/run_args, handling every outcome gracefully."""
+    project_path = state["project_path"]
+    action = state.get("action")
+    runner = ACTION_RUNNERS.get(action)
+    print(f"\n=== Resuming {project_path} (action={action}, was paused: {state['paused_reason']}) ===")
+    if runner is None:
+        print(f"=== {project_path}: no runner for action={action!r} -- skipping (stale/unrecognized row). ===")
+        return
+    try:
+        runner(project_path, state["run_args"])
+        print(f"=== {project_path}: resumed {action} finished ===")
+    except ag.PausedForQuotaError:
+        print(f"=== {project_path}: paused again immediately -- usage still high. Will retry next check. ===")
+    except ag.ReviewRequiredError:
+        # Resuming a quota pause can walk straight into a NEW
+        # review-required gate (e.g. Stage 1 was what was paused; Stage
+        # 2's gate is reached for the first time on this very resume).
+        # Also an expected, graceful stop -- state_store already has it
+        # recorded as PAUSED_REVIEW, not a failure.
+        print(f"=== {project_path}: hit a --review-required gate -- needs your review before continuing further. ===")
+    except (ag.GeneratorError, PipelineError, er.UnknownEngineError) as exc:
+        print(f"=== {project_path}: resume failed: {exc} ===")
+        ss.mark_failed(project_path, action or "unknown", str(exc), action=action, run_args=state["run_args"])
+
+
 def check_resume():
     """
     Resume every project state_store shows as due: PAUSED_QUOTA,
@@ -291,30 +320,27 @@ def check_resume():
     if not due:
         print("check-resume: nothing due.")
         return
-
     for state in due:
-        project_path = state["project_path"]
-        action = state.get("action")
-        runner = ACTION_RUNNERS.get(action)
-        print(f"\n=== Resuming {project_path} (action={action}, was paused: {state['paused_reason']}) ===")
-        if runner is None:
-            print(f"=== {project_path}: no runner for action={action!r} -- skipping (stale/unrecognized row). ===")
-            continue
-        try:
-            runner(project_path, state["run_args"])
-            print(f"=== {project_path}: resumed {action} finished ===")
-        except ag.PausedForQuotaError:
-            print(f"=== {project_path}: paused again immediately -- usage still high. Will retry next check. ===")
-        except ag.ReviewRequiredError:
-            # Resuming a quota pause can walk straight into a NEW
-            # review-required gate (e.g. Stage 1 was what was paused;
-            # Stage 2's gate is reached for the first time on this very
-            # resume). Also an expected, graceful stop -- state_store
-            # already has it recorded as PAUSED_REVIEW, not a failure.
-            print(f"=== {project_path}: hit a --review-required gate -- needs your review before continuing further. ===")
-        except (ag.GeneratorError, PipelineError, er.UnknownEngineError) as exc:
-            print(f"=== {project_path}: resume failed: {exc} ===")
-            ss.mark_failed(project_path, action or "unknown", str(exc), action=action, run_args=state["run_args"])
+        _resume_one(state)
+
+
+def resume_project(project_path):
+    """
+    Resume ONE specific project right now, regardless of whether it's
+    "due" or was launched with --auto-resume -- unlike check_resume(),
+    this is an explicit, targeted request (the dashboard's per-project
+    Resume button), so neither gate applies. Works for both PAUSED_QUOTA
+    and PAUSED_REVIEW (check_resume() only ever touches PAUSED_QUOTA
+    rows, since due_paused_projects() intentionally excludes
+    PAUSED_REVIEW -- see mark_paused_review()'s docstring).
+    """
+    project_path = Path(project_path).expanduser().resolve()
+    state = ss.get_state(project_path)
+    if state is None:
+        raise PipelineError(f"No tracked state found for {project_path}.")
+    if state["status"] not in (ss.STATUS_PAUSED_QUOTA, ss.STATUS_PAUSED_REVIEW):
+        raise PipelineError(f"{project_path} is not currently paused (status: {state['status']}).")
+    _resume_one(state)
 
 
 # ======================================================================
@@ -346,6 +372,9 @@ def main():
 
         elif args.action == "verify":
             run_verify_action(project_path, build_fixver_run_args(args, args.branch))
+
+        elif args.action == "resume-project":
+            resume_project(project_path)
 
     except (ag.PausedForQuotaError, ag.ReviewRequiredError):
         sys.exit(0)
