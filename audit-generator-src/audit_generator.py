@@ -836,7 +836,7 @@ def run_generator(project_path, branch, max_turns, review_required, auto_push, u
         ss.mark_failed(project_path, "unknown", str(exc), action="generate", run_args=run_args)
         raise
 
-    ss.mark_completed(project_path, stage="stage3", action="generate")
+    ss.mark_completed(project_path, stage="stage3", action="generate", run_args=run_args)
 
     print_banner("AUDIT GENERATOR -- DONE", color=TermColors.GREEN)
     print(f"AUDIT.md is ready at: {audit_path}")

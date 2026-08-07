@@ -245,7 +245,14 @@ def mark_paused_review(project_path, stage, reason, action=None, run_args=None, 
     )
 
 
-def mark_completed(project_path, stage=None, action=None, db_path=None):
+def mark_completed(project_path, stage=None, action=None, run_args=None, db_path=None):
+    """
+    run_args is preserved (not wiped) on completion -- resolve_branch()
+    in pipeline.py reads the branch back out of the most recent tracked
+    run (regardless of status) so a later, independently-triggered fix/
+    verify can infer which branch AUDIT.md lives on without you having to
+    pass --branch every time.
+    """
     _upsert(
         project_path,
         db_path=db_path,
@@ -255,7 +262,7 @@ def mark_completed(project_path, stage=None, action=None, db_path=None):
         paused_reason=None,
         resume_at=None,
         auto_resume=0,
-        run_args_json=json.dumps({}),
+        run_args_json=json.dumps(run_args or {}),
         last_error=None,
     )
 
