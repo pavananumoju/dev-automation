@@ -91,6 +91,20 @@ class PausedForQuotaError(Exception):
     """
 
 
+class ReviewRequiredError(Exception):
+    """
+    Raised (handled the same way as PausedForQuotaError -- an expected,
+    graceful stop) when --review-required's gate is reached. Deliberately
+    NOT a blocking input() prompt: this can be launched as a detached
+    background process (the dashboard does exactly that) with no attached
+    stdin, where a blocking prompt would just hang forever, invisibly.
+    Instead this records PAUSED_REVIEW in state_store and stops cleanly --
+    review the file, then re-run the exact same command (or click Resume
+    in the dashboard) whenever ready, the same resume model already used
+    for usage-limit pauses.
+    """
+
+
 FALLBACK_RESUME_DELAY_HOURS = 6
 
 
@@ -666,13 +680,11 @@ def run_stage2(project_path, logs_folder, max_turns, auto_push, branch_name, rev
                 push_branch_to_origin(project_path, branch_name)
 
     if review_required and not already_existed:
-        print(f"\n--review-required: review {prompt_path} now (hand-edit it if you want).")
-        answer = input("Continue to Stage 3 and execute this audit prompt? [y/N]: ")
-        if answer.strip().lower() != "y":
-            raise GeneratorError(
-                "Stopped at your request after Stage 2. Edit audit-gen/AUDIT_PROMPT.md if "
-                "needed, then re-run this same command to continue from Stage 3."
-            )
+        reason = f"review {prompt_path} before Stage 3 executes it"
+        ss.mark_paused_review(project_path, "Stage 2 (Audit Prompt Build)", reason, action=pause_ctx["action"], run_args=pause_ctx["run_args"])
+        print(f"\n--review-required: {reason} (hand-edit it if you want).")
+        print("Re-run this same command (or click Resume in the dashboard) once you're ready to continue to Stage 3.")
+        raise ReviewRequiredError(reason)
 
 
 def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, review_required, pause_ctx):
@@ -724,11 +736,21 @@ def run_stage3(project_path, logs_folder, max_turns, auto_push, branch_name, rev
             if auto_push:
                 push_branch_to_origin(project_path, branch_name)
 
-    if review_required:
-        print(f"\n--review-required: review staged findings under {project_path / 'audit-gen' / 'staging'} now.")
-        answer = input("Continue and compile them into AUDIT.md? [y/N]: ")
-        if answer.strip().lower() != "y":
-            raise GeneratorError("Stopped at your request before compiling. Re-run this same command when ready.")
+    # A plain marker file, not state_store, is what makes this gate
+    # "already passed" on resume -- mirrors Stage 2's own
+    # `not already_existed` check just above run_stage2(). Written BEFORE
+    # pausing (not after an approval, since there's no interactive
+    # approval step anymore): reaching this gate once and stopping here is
+    # itself what the marker records; re-running (by hand, or the
+    # dashboard's Resume button) is what counts as approval.
+    review_marker_path = project_path / "audit-gen" / "staging" / ".stage3_reviewed"
+    if review_required and not review_marker_path.exists():
+        review_marker_path.write_text("reviewed\n", encoding="utf-8")
+        reason = f"review staged findings under {project_path / 'audit-gen' / 'staging'} before compiling"
+        ss.mark_paused_review(project_path, "Stage 3 (compile gate)", reason, action=pause_ctx["action"], run_args=pause_ctx["run_args"])
+        print(f"\n--review-required: {reason}.")
+        print("Re-run this same command (or click Resume in the dashboard) once you're ready to compile AUDIT.md.")
+        raise ReviewRequiredError(reason)
 
     print_banner("COMPILING AUDIT.md")
     audit_path = audit_compiler.compile_audit_md(project_path)
@@ -786,10 +808,10 @@ def run_generator(project_path, branch, max_turns, review_required, auto_push, u
     `python3 audit_generator.py ...` subprocess or duplicating this flow.
 
     Returns the Path to AUDIT.md on success. Raises PausedForQuotaError,
-    GeneratorError, or engine_registry.UnknownEngineError -- callers
-    decide how to present those (main() turns them into exit codes and
-    console messages; pipeline.py's resume loop just needs to know a
-    given project didn't finish so it can move on to the next one).
+    ReviewRequiredError, GeneratorError, or engine_registry.UnknownEngineError
+    -- callers decide how to present those (main() turns them into exit
+    codes and console messages; pipeline.py's resume loop just needs to
+    know a given project didn't finish so it can move on to the next one).
     """
     project_path = Path(project_path)
     audit_path = project_path / "AUDIT.md"
@@ -875,10 +897,10 @@ def main():
             args.hard_pause_threshold,
             args.auto_resume,
         )
-    except PausedForQuotaError:
-        # Already fully reported and recorded by check_hard_pause() -- this
-        # is an expected, graceful stop, not a failure, so no ERROR banner
-        # and no non-zero exit code.
+    except (PausedForQuotaError, ReviewRequiredError):
+        # Already fully reported and recorded (by check_hard_pause() or the
+        # review-gate code) -- both are expected, graceful stops, not
+        # failures, so no ERROR banner and no non-zero exit code.
         sys.exit(0)
     except GeneratorError as exc:
         print(f"\n{TermColors.RED}ERROR: {exc}{TermColors.RESET}")

@@ -305,6 +305,13 @@ def check_resume():
             print(f"=== {project_path}: resumed {action} finished ===")
         except ag.PausedForQuotaError:
             print(f"=== {project_path}: paused again immediately -- usage still high. Will retry next check. ===")
+        except ag.ReviewRequiredError:
+            # Resuming a quota pause can walk straight into a NEW
+            # review-required gate (e.g. Stage 1 was what was paused;
+            # Stage 2's gate is reached for the first time on this very
+            # resume). Also an expected, graceful stop -- state_store
+            # already has it recorded as PAUSED_REVIEW, not a failure.
+            print(f"=== {project_path}: hit a --review-required gate -- needs your review before continuing further. ===")
         except (ag.GeneratorError, PipelineError, er.UnknownEngineError) as exc:
             print(f"=== {project_path}: resume failed: {exc} ===")
             ss.mark_failed(project_path, action or "unknown", str(exc), action=action, run_args=state["run_args"])
@@ -340,7 +347,7 @@ def main():
         elif args.action == "verify":
             run_verify_action(project_path, build_fixver_run_args(args, args.branch))
 
-    except ag.PausedForQuotaError:
+    except (ag.PausedForQuotaError, ag.ReviewRequiredError):
         sys.exit(0)
     except (ag.GeneratorError, PipelineError, er.UnknownEngineError) as exc:
         print(f"\nERROR: {exc}")
