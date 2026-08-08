@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "audit-fix-runner-src"))
 import state_store as ss  # noqa: E402
 import audit_generator as ag  # noqa: E402  (reused only for DEFAULT_MAX_TURNS/print_dry_run_plan)
 import audit_fix_runner as afr  # noqa: E402  (reused only for its table parser -- see view_audit_table())
+import engine_registry as er  # noqa: E402  (reused only for check_usage() -- see usage header below)
 
 PIPELINE_PATH = REPO_ROOT / "pipeline-src" / "pipeline.py"
 
@@ -83,6 +84,30 @@ def launch_pipeline_background(args_list):
     """Start pipeline.py as a detached background subprocess. Never blocks the dashboard -- progress shows up in state_store on the next refresh."""
     command = [sys.executable, str(PIPELINE_PATH)] + args_list
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+@st.cache_data(ttl=30)
+def get_cached_usage():
+    """
+    claude /usage doesn't consume any session/weekly token budget -- it's
+    an account-level query, not a prompt -- but it does take a few real
+    seconds (spinning up the CLI subprocess) each time. Streamlit reruns
+    this entire script on every single click/checkbox toggle, so without
+    caching, just clicking around the page would spawn a fresh `claude
+    /usage` subprocess on every rerun for no reason. A short TTL keeps the
+    header reasonably fresh without that overhead.
+    """
+    return er.get_engine("claude").check_usage()
+
+
+def usage_bar_label(percent):
+    if percent is None:
+        return "unknown"
+    if percent >= 90:
+        return f":red[{percent}% used]"
+    if percent >= 70:
+        return f":orange[{percent}% used]"
+    return f":green[{percent}% used]"
 
 
 def run_pipeline_foreground(args_list, timeout=30):
@@ -135,7 +160,22 @@ def build_fixver_args(action, project_path, branch, test_cmd, max_rows, severiti
 # ======================================================================
 
 st.set_page_config(page_title="Dev Automation Pipeline", layout="wide")
-st.title("Dev Automation Pipeline")
+
+header_title_col, header_usage_col = st.columns([2, 1])
+with header_title_col:
+    st.title("Dev Automation Pipeline")
+with header_usage_col:
+    usage = get_cached_usage()
+    st.caption(
+        f"**Session (5h)** — {usage_bar_label(usage.session_percent)}"
+        + (f" · resets {usage.session_reset}" if usage.session_reset else "")
+    )
+    st.progress((usage.session_percent or 0) / 100)
+    st.caption(
+        f"**Weekly** — {usage_bar_label(usage.week_percent)}"
+        + (f" · resets {usage.week_reset}" if usage.week_reset else "")
+    )
+    st.progress((usage.week_percent or 0) / 100)
 
 with st.sidebar:
     st.header("Controls")
